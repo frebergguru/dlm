@@ -1643,7 +1643,7 @@ static void on_activate(GtkApplication *app, gpointer user)
     GtkWidget *win = adw_application_window_new(app);
     a->win = GTK_WINDOW(win);
     gtk_window_set_title(a->win, "dlm");
-    gtk_window_set_default_size(a->win, 760, 600);
+    gtk_window_set_default_size(a->win, 960, 600);
 
     GtkWidget *header = adw_header_bar_new();
 
