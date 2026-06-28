@@ -79,6 +79,8 @@ typedef struct {
     int group_mode;         /* GROUP_SITE_PKG | GROUP_SITE | GROUP_PKG */
     char **csites;          /* client-side collapsed site hosts (linkgrabber) */
     int ncsites;
+    int open_menus;         /* open row popovers; rebuilds are deferred while >0 */
+    int pending_rebuild;    /* a refresh arrived while a menu was open */
 } App;
 
 static App g_app;
@@ -199,6 +201,27 @@ static void pop_sep(GtkWidget *box)
 }
 
 /* Build a "⋮" menu button whose popover contains `box` (caller fills it). */
+static void rebuild_list(App *a); /* fwd */
+
+/* While a row menu is open, the live refresh must not tear down the list (it
+ * would dismiss the menu). Count open popovers and defer rebuilds until none
+ * remain. */
+static void on_menu_shown(GtkWidget *pop, gpointer user)
+{
+    (void)pop;
+    ((App *)user)->open_menus++;
+}
+static void on_menu_closed(GtkPopover *pop, gpointer user)
+{
+    (void)pop;
+    App *a = user;
+    if (a->open_menus > 0) a->open_menus--;
+    if (a->open_menus == 0 && a->pending_rebuild) {
+        a->pending_rebuild = 0;
+        rebuild_list(a);
+    }
+}
+
 static GtkWidget *menu_button(GtkWidget **box_out, GtkPopover **pop_out)
 {
     GtkWidget *mb = gtk_menu_button_new();
@@ -210,6 +233,8 @@ static GtkWidget *menu_button(GtkWidget **box_out, GtkPopover **pop_out)
     gtk_widget_set_margin_start(box, 6); gtk_widget_set_margin_end(box, 6);
     gtk_popover_set_child(GTK_POPOVER(pop), box);
     gtk_menu_button_set_popover(GTK_MENU_BUTTON(mb), pop);
+    g_signal_connect(pop, "show", G_CALLBACK(on_menu_shown), &g_app);
+    g_signal_connect(pop, "closed", G_CALLBACK(on_menu_closed), &g_app);
     *box_out = box;
     *pop_out = GTK_POPOVER(pop);
     return mb;
@@ -883,8 +908,14 @@ static void render_into(App *a, GtkListBox *list, const char *view,
 
 static void rebuild_list(App *a)
 {
-    render_into(a, a->dlist, "download", current_filter(a));
-    render_into(a, a->glist, "linkgrabber", NULL);
+    /* Don't rebuild rows while a menu is open — it would dismiss the popover.
+     * The status bar below still updates; the rows refresh once it closes. */
+    if (a->open_menus > 0) {
+        a->pending_rebuild = 1;
+    } else {
+        render_into(a, a->dlist, "download", current_filter(a));
+        render_into(a, a->glist, "linkgrabber", NULL);
+    }
 
     double total_speed = 0;
     int dl = 0, lg = 0;
