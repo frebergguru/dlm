@@ -1,40 +1,47 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — Internet Archive authentication / credential storage. */
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "dlm/iaauth.h"
 #include "dlm/dlm.h"
 #include "httpget.h"
 #include "internal.h"
+#include "compat/compat.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <jansson.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#if defined(_WIN32)
+#  include <io.h>
+#else
+#  include <unistd.h>
+#endif
+
+/* Scrub a sensitive buffer before freeing/returning so plaintext credentials
+ * don't linger in freed heap or stack. Volatile pointer defeats dead-store
+ * elimination without depending on a platform explicit_bzero. */
+static void secure_zero(void *p, size_t n)
+{
+    if (!p) return;
+    volatile unsigned char *v = p;
+    while (n--) *v++ = 0;
+}
 
 /* ---- config path ------------------------------------------------------ */
-
-static void config_dir(char *buf, size_t n)
-{
-    const char *cfg = getenv("XDG_CONFIG_HOME");
-    if (cfg && *cfg) snprintf(buf, n, "%s/dlm", cfg);
-    else snprintf(buf, n, "%s/.config/dlm", getenv("HOME") ? getenv("HOME") : ".");
-}
 
 static void config_path(char *buf, size_t n)
 {
     char dir[400];
-    config_dir(dir, sizeof dir);
+    dlm_config_dir(dir, sizeof dir);
     snprintf(buf, n, "%s/credentials", dir);
 }
 
 static void ensure_config_dir(void)
 {
     char dir[400];
-    config_dir(dir, sizeof dir);
-    /* create parent then dir (best effort) */
-    char *slash = strrchr(dir, '/');
-    if (slash) { *slash = '\0'; mkdir(dir, 0755); *slash = '/'; }
-    mkdir(dir, 0700);
+    dlm_config_dir(dir, sizeof dir);
+    dlm_mkdir_p(dir);
 }
 
 /* ---- load / save ------------------------------------------------------ */
@@ -102,7 +109,7 @@ static int save_root(json_t *ia)
     /* Create the temp file 0600 up front: the secret must never touch the disk
      * with broader permissions, which json_dump_file would do (it fopen()s the
      * file 0644 & ~umask and only then would we chmod it). */
-    int fd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    int fd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC | DLM_O_BINARY, 0600);
     if (fd < 0) {
         DLM_ERROR("ia: cannot create %s: %s", tmp, strerror(errno));
         json_decref(root);
@@ -118,8 +125,12 @@ static int save_root(json_t *ia)
     int rc = json_dumpf(root, fp, JSON_INDENT(2));
     if (fclose(fp) != 0) rc = -1;
     json_decref(root);
-    if (rc != 0) { DLM_ERROR("ia: cannot write %s", tmp); return -1; }
-    if (rename(tmp, path) != 0) { DLM_ERROR("ia: cannot rename config"); return -1; }
+    if (rc != 0) { DLM_ERROR("ia: cannot write %s", tmp); remove(tmp); return -1; }
+    if (dlm_rename_replace(tmp, path) != 0) {
+        DLM_ERROR("ia: cannot rename config");
+        remove(tmp); /* don't leave a stale partial credential file behind */
+        return -1;
+    }
     return 0;
 }
 
@@ -146,7 +157,7 @@ int dlm_ia_logout(void)
 {
     char path[512];
     config_path(path, sizeof path);
-    unlink(path);
+    remove(path);
     return 0;
 }
 
@@ -175,6 +186,7 @@ char **dlm_ia_auth_headers(const ia_credentials *c)
         return NULL;
     }
     h[1] = NULL;
+    secure_zero(buf, sizeof buf); /* scrub the secret/cookie copy off the stack */
     return h;
 }
 
@@ -213,6 +225,8 @@ int dlm_ia_login_password(const char *email, const char *password, char **err)
     char *p = form_encode(password);
     char *fields = dlm_xmalloc(strlen(e) + strlen(p) + 32);
     sprintf(fields, "email=%s&password=%s", e, p);
+    secure_zero(e, strlen(e));
+    secure_zero(p, strlen(p));
     free(e);
     free(p);
 
@@ -221,6 +235,7 @@ int dlm_ia_login_password(const char *email, const char *password, char **err)
     const char *hdrs[] = {"Accept: application/json", NULL};
     int rc = dlm_http_request("https://archive.org/services/xauthn/?op=login",
                               fields, hdrs, &body, &status);
+    secure_zero(fields, strlen(fields)); /* contains the plaintext password */
     free(fields);
     if (rc != DLM_OK) {
         if (err) *err = dlm_xstrdup("network error contacting archive.org");
@@ -245,6 +260,7 @@ int dlm_ia_login_password(const char *email, const char *password, char **err)
                     snprintf(cookie, sizeof cookie,
                              "logged-in-user=%s; logged-in-sig=%s", user, sig);
                     if (dlm_ia_save_cookie(cookie) == 0) ok = 1;
+                    secure_zero(cookie, sizeof cookie); /* session credential */
                 }
             }
             if (!ok) {

@@ -1,10 +1,14 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — extractor dispatch.
  *
- * Routes a URL to the right extractor. archive.org is handled natively; any
- * other URL becomes a single direct-download task (a later phase adds yt-dlp as
- * the fallback for arbitrary sites).
+ * Routes a URL to the right extractor. archive.org is handled natively; a URL
+ * that looks like a direct file is fetched by the engine; anything else is
+ * resolved through yt-dlp, and if yt-dlp rejects it we fall back to a direct
+ * engine download so generic files still work.
  */
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "dlm/extract.h"
 #include "dlm/dlm.h"
 #include "extractors/archiveorg.h"
@@ -12,7 +16,6 @@
 #include "internal.h"
 
 #include <ctype.h>
-#include <strings.h>
 
 void dlm_extract_result_free(dlm_extract_result *r)
 {
@@ -91,5 +94,13 @@ int dlm_extract(const char *url, dlm_extract_result *out)
     if (looks_like_direct_file(url))
         return extract_direct(url, out);
     /* a web page / stream: resolve via yt-dlp */
-    return dlm_extract_ytdlp(url, out);
+    int rc = dlm_extract_ytdlp(url, out);
+    if (rc == DLM_OK)
+        return rc;
+    /* yt-dlp rejected this URL (unsupported site, or no extractable media).
+     * Fall back to fetching it directly with the engine — this is how generic
+     * files (download endpoints, extensionless or unrecognised URLs) that
+     * yt-dlp refuses still get downloaded. */
+    DLM_INFO("yt-dlp could not handle %s; downloading it directly", url);
+    return extract_direct(url, out);
 }

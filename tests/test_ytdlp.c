@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Offline test: yt-dlp JSON -> tasks, without invoking yt-dlp. Verifies the
  * progressive-http path (engine download) vs the fragmented/merge path
  * (delegate to yt-dlp), header passthrough, and playlist entries. */

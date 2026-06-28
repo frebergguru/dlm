@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Offline tests: archive.org URL recognition + IA credential storage/headers. */
 #include "dlm/extract.h"
 #include "dlm/iaauth.h"

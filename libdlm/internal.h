@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — internal helpers shared across translation units. Not installed. */
 #ifndef DLM_INTERNAL_H
 #define DLM_INTERNAL_H
@@ -15,8 +16,15 @@
 typedef enum { DLM_LOG_ERROR = 0, DLM_LOG_WARN, DLM_LOG_INFO, DLM_LOG_DEBUG } dlm_log_level;
 
 dlm_log_level dlm_log_threshold(void);
+/* Use MinGW's printf archetype so %zu/%lld are checked against its ANSI-stdio
+ * implementation rather than MSVCRT's; plain printf elsewhere. */
+#if defined(__MINGW_PRINTF_FORMAT)
+#  define DLM_PRINTF_ARCHETYPE __MINGW_PRINTF_FORMAT
+#else
+#  define DLM_PRINTF_ARCHETYPE printf
+#endif
 void dlm_logf(dlm_log_level lvl, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+    __attribute__((format(DLM_PRINTF_ARCHETYPE, 2, 3)));
 
 #define DLM_LOG(lvl, ...)                                                      \
     do {                                                                      \

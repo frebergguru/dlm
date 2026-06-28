@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — Internet Archive authentication.
  *
  * Downloads work anonymously by default. The user may optionally sign in to

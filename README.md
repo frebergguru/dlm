@@ -181,3 +181,14 @@ work against the same socket.
 JDownloader's plugin ecosystem, captcha solving, premium-host accounts, and
 Click'n'Load are intentionally not reimplemented: site coverage comes from
 yt-dlp, and archive.org is the one natively-supported provider.
+
+## License
+
+dlm is free software, licensed under the **GNU General Public License, version 3
+or (at your option) any later version (GPL-3.0-or-later)**. See the [LICENSE](LICENSE)
+file for the full text; every source file carries an SPDX
+`GPL-3.0-or-later` identifier.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.

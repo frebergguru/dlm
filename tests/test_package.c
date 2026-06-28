@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Offline test: JDownloader-style queue features — linkgrabber staging,
  * packages, confirm, priorities, enable/disable, per-link & global autostart,
  * force, reordering, and clear-finished.

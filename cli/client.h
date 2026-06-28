@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* dlm CLI — daemon client transport.
  *
  * Connects to the dlmd AF_UNIX socket, auto-starting the daemon if it is not
@@ -19,5 +20,9 @@ char *dlm_client_rpc(int fd, const char *json_request);
 /* Read a single line from the socket (for streaming subscribe events).
  * Returns malloc'd line or NULL on EOF/error. */
 char *dlm_client_read_line(int fd);
+
+/* Close a client socket fd returned by the connect functions. (Necessary
+ * because a raw close() is wrong for Windows sockets.) */
+void dlm_client_close(int fd);
 
 #endif /* DLM_CLIENT_H */

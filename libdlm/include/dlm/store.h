@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — durable queue persistence (sqlite3).
  *
  * Stores one row per download (a "link", in JDownloader terms) plus one row per

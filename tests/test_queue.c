@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Offline test: queue state machine + persistence across a simulated restart.
  *
  * Uses max_active=0 so no worker threads start (no network); this exercises the

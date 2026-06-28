@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* dlmd — download queue / scheduler, modelled on JDownloader.
  *
  * Owns two lists of "links" (downloads): the **linkgrabber**, a staging area

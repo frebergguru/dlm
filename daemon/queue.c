@@ -1,20 +1,22 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* dlmd — download queue / scheduler implementation (JDownloader-style:
  * linkgrabber staging, packages, priorities, enable/disable, manual start). */
 #define _POSIX_C_SOURCE 200809L
 #include "queue.h"
 #include "dlm/dlm.h"
+#include "dlm/tools.h"
+#include "compat/compat.h"
 
 #include <errno.h>
-#include <poll.h>
 #include <pthread.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/wait.h>
 #include <time.h>
-#include <unistd.h>
+#if !defined(_WIN32)
+#  include <strings.h>
+#  include <unistd.h>
+#endif
 
 typedef struct {
     int64_t id;
@@ -203,9 +205,9 @@ static void cleanup_partial_files(qitem *it)
     size_t n = strlen(it->out_path);
     char *p = malloc(n + 10);
     sprintf(p, "%s.dlmpart", it->out_path);
-    unlink(p);
+    remove(p);
     sprintf(p, "%s.dlmjson", it->out_path);
-    unlink(p);
+    remove(p);
     free(p);
 }
 
@@ -263,15 +265,17 @@ static void parse_progress_line(qitem *it, char *line)
  * code; honors the cancel flag by killing the child. */
 static dlm_result run_ytdlp(qitem *it, int64_t rate)
 {
-    const char *argv[24];
+    const char *argv[28];
     int n = 0;
-    argv[n++] = "yt-dlp";
+    argv[n++] = dlm_tool_path("yt-dlp");
     argv[n++] = "--no-warnings";
     argv[n++] = "--no-playlist";
     argv[n++] = "--newline";
     argv[n++] = "--progress";
     argv[n++] = "--progress-template";
     argv[n++] = DLM_YTDLP_TMPL;
+    const char *ffdir = dlm_tool_ffmpeg_dir();
+    if (ffdir) { argv[n++] = "--ffmpeg-location"; argv[n++] = ffdir; }
     char ratebuf[32];
     if (rate > 0) {
         snprintf(ratebuf, sizeof ratebuf, "%lld", (long long)rate);
@@ -286,58 +290,43 @@ static dlm_result run_ytdlp(qitem *it, int64_t rate)
     argv[n++] = it->url;
     argv[n] = NULL;
 
-    int pfd[2];
-    if (pipe(pfd) != 0) return DLM_ERR_IO;
-    pid_t pid = fork();
-    if (pid < 0) { close(pfd[0]); close(pfd[1]); return DLM_ERR_IO; }
-    if (pid == 0) {
-        dup2(pfd[1], STDOUT_FILENO);
-        dup2(pfd[1], STDERR_FILENO);
-        close(pfd[0]);
-        close(pfd[1]);
-        execvp("yt-dlp", (char *const *)argv);
-        _exit(127);
-    }
-    close(pfd[1]);
+    dlm_proc *proc = dlm_proc_spawn(argv, DLM_SPAWN_STDOUT_ERR);
+    if (!proc) return DLM_ERR_IO;
 
-    /* read yt-dlp output line by line, parsing progress; poll so we can react
-     * to a cancel request promptly */
+    /* read yt-dlp output line by line, parsing progress; the 200ms read timeout
+     * lets us react to a cancel request promptly */
     char buf[8192];
     size_t len = 0;
     int killed = 0;
     for (;;) {
-        struct pollfd p = {pfd[0], POLLIN, 0};
-        int pr = poll(&p, 1, 200);
-        if (it->cancel && !killed) { kill(pid, SIGTERM); killed = 1; }
-        if (pr < 0) {
-            if (errno == EINTR) continue;
-            break;
+        long got = dlm_proc_read(proc, buf + len, sizeof buf - len - 1, 200);
+        if (it->cancel && !killed) { dlm_proc_terminate(proc); killed = 1; }
+        if (got < 0) continue; /* timeout: re-check cancel */
+        if (got == 0) break;   /* EOF */
+        len += (size_t)got;
+        buf[len] = '\0';
+        char *start = buf, *nl;
+        while ((nl = memchr(start, '\n', (size_t)(buf + len - start)))) {
+            *nl = '\0';
+            parse_progress_line(it, start);
+            start = nl + 1;
         }
-        if (pr == 0) continue; /* timeout: re-check cancel */
-        if (p.revents & POLLIN) {
-            ssize_t got = read(pfd[0], buf + len, sizeof buf - len - 1);
-            if (got <= 0) break; /* EOF */
-            len += (size_t)got;
+        size_t left = (size_t)(buf + len - start);
+        memmove(buf, start, left);
+        len = left;
+        /* An overlong line with no newline would fill the buffer and make the
+         * next read request 0 bytes (misread as EOF). Flush it instead. */
+        if (len == sizeof buf - 1) {
             buf[len] = '\0';
-            char *start = buf, *nl;
-            while ((nl = memchr(start, '\n', (size_t)(buf + len - start)))) {
-                *nl = '\0';
-                parse_progress_line(it, start);
-                start = nl + 1;
-            }
-            size_t left = (size_t)(buf + len - start);
-            memmove(buf, start, left);
-            len = left;
-        } else if (p.revents & (POLLHUP | POLLERR)) {
-            break;
+            parse_progress_line(it, buf);
+            len = 0;
         }
     }
-    close(pfd[0]);
 
-    int status = 0;
-    waitpid(pid, &status, 0);
+    int ec = -1;
+    dlm_proc_wait(proc, &ec);
+    dlm_proc_free(proc);
     if (it->cancel) return DLM_ERR_CANCELLED;
-    int ec = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     return ec == 0 ? DLM_OK : DLM_ERR_NET;
 }
 

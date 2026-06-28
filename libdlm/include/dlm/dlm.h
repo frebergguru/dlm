@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — public API for the dlm download engine.
  *
  * Phase 1 surface: a self-contained segmented HTTP(S) downloader with resume.

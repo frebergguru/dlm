@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — native archive.org extractor.
  *
  * Resolves an archive.org item (details/download/metadata URL) into one task
@@ -9,15 +10,20 @@
  * The current IA auth (anonymous, S3 keys, or cookie) is applied to every
  * request so account-restricted items work when signed in.
  */
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "archiveorg.h"
 #include "dlm/dlm.h"
 #include "dlm/iaauth.h"
 #include "httpget.h"
 #include "internal.h"
+#include "compat/compat.h"
 
 #include <jansson.h>
-#include <strings.h>
+#if !defined(_WIN32)
+#  include <strings.h>
+#endif
 
 /* host is (something.)archive.org ? */
 static int host_is_archiveorg(const char *url)

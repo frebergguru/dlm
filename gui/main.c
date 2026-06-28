@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* dlm-gui — GTK4 + libadwaita front-end for the dlm download daemon.
  *
  * The GUI is a thin, reactive view over dlmd: it opens a long-lived "subscribe"
@@ -10,13 +11,29 @@
 #include "dlm/dlm.h"
 #include "dlm/extract.h"
 #include "dlm/iaauth.h"
+#include "dlm/tools.h"
+#include "compat/compat.h"
 
 #include <adwaita.h>
 #include <errno.h>
-#include <glib-unix.h>
 #include <jansson.h>
 #include <string.h>
-#include <unistd.h>
+
+/* Watch a (possibly Winsock) socket fd within the GLib main loop. g_unix_fd_add
+ * is POSIX-only, so we go through a GIOChannel, which has a Win32-socket
+ * constructor. The callback receives the GIOChannel; recover the fd from the
+ * App state. */
+static guint dlm_gui_add_socket_watch(int fd, GIOCondition cond, GIOFunc fn, gpointer data)
+{
+#if defined(_WIN32)
+    GIOChannel *ch = g_io_channel_win32_new_socket(fd);
+#else
+    GIOChannel *ch = g_io_channel_unix_new(fd);
+#endif
+    guint id = g_io_add_watch(ch, cond, fn, data);
+    g_io_channel_unref(ch);
+    return id;
+}
 
 /* libdlm/httpget.c — declared here to avoid pulling in the private header. */
 int dlm_http_get_blob(const char *url, const char *const *headers, char **body,
@@ -107,7 +124,7 @@ static void send_cmd(const char *json)
     if (fd < 0) { toast(&g_app, "Cannot reach daemon"); return; }
     char *resp = dlm_client_rpc(fd, json);
     free(resp);
-    close(fd);
+    dlm_client_close(fd);
 }
 
 /* ---- generic, parameterized row/package action ----------------------- */
@@ -706,7 +723,6 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber)
         GtkWidget *edit = gtk_button_new_with_label("Edit package…");
         gtk_widget_add_css_class(edit, "flat");
         g_object_set_data(G_OBJECT(edit), "pid", (gpointer)(intptr_t)id);
-        g_object_set_data_full(G_OBJECT(edit), "pop", g_object_ref(pop), g_object_unref);
         g_signal_connect(edit, "clicked", G_CALLBACK(on_pkg_edit_clicked), &g_app);
         gtk_box_append(GTK_BOX(box), edit);
         pop_add(box, pop, "Remove package", ctx_make("lg_remove", id, 1));
@@ -726,7 +742,6 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber)
         GtkWidget *edit = gtk_button_new_with_label("Edit package…");
         gtk_widget_add_css_class(edit, "flat");
         g_object_set_data(G_OBJECT(edit), "pid", (gpointer)(intptr_t)id);
-        g_object_set_data_full(G_OBJECT(edit), "pop", g_object_ref(pop), g_object_unref);
         g_signal_connect(edit, "clicked", G_CALLBACK(on_pkg_edit_clicked), &g_app);
         gtk_box_append(GTK_BOX(box), edit);
         pop_add(box, pop, "Remove package", ctx_make("rm", id, 1));
@@ -942,11 +957,11 @@ static void rebuild_list(App *a)
 static void free_items(App *a)
 {
     for (int i = 0; i < a->n; i++) {
-        free(a->items[i].name);
-        free(a->items[i].state);
-        free(a->items[i].list);
-        free(a->items[i].availability);
-        free(a->items[i].url);
+        g_free(a->items[i].name);
+        g_free(a->items[i].state);
+        g_free(a->items[i].list);
+        g_free(a->items[i].availability);
+        g_free(a->items[i].url);
     }
     free(a->items);
     a->items = NULL;
@@ -956,9 +971,9 @@ static void free_items(App *a)
 static void free_pkgs(App *a)
 {
     for (int i = 0; i < a->npkg; i++) {
-        free(a->pkgs[i].name);
-        free(a->pkgs[i].folder);
-        free(a->pkgs[i].list);
+        g_free(a->pkgs[i].name);
+        g_free(a->pkgs[i].folder);
+        g_free(a->pkgs[i].list);
     }
     free(a->pkgs);
     a->pkgs = NULL;
@@ -971,6 +986,7 @@ static void apply_packages(App *a, json_t *arr)
     if (!json_is_array(arr)) return;
     a->npkg = (int)json_array_size(arr);
     a->pkgs = a->npkg ? calloc((size_t)a->npkg, sizeof(Pkg)) : NULL;
+    if (!a->pkgs) { a->npkg = 0; return; }
     size_t i;
     json_t *o;
     json_array_foreach(arr, i, o) {
@@ -991,6 +1007,7 @@ static void apply_downloads(App *a, json_t *arr)
     if (!json_is_array(arr)) return;
     a->n = (int)json_array_size(arr);
     a->items = a->n ? calloc((size_t)a->n, sizeof(Dl)) : NULL;
+    if (!a->items) { a->n = 0; return; }
     size_t i;
     json_t *o;
     json_array_foreach(arr, i, o) {
@@ -1038,13 +1055,14 @@ static void handle_line(App *a, const char *line)
 
 static void schedule_reconnect(App *a);
 
-static gboolean on_socket_readable(gint fd, GIOCondition cond, gpointer user)
+static gboolean on_socket_readable(GIOChannel *src, GIOCondition cond, gpointer user)
 {
+    (void)src;
     App *a = user;
     if (cond & (G_IO_HUP | G_IO_ERR)) goto closed;
 
     char buf[8192];
-    ssize_t got = read(fd, buf, sizeof buf);
+    long got = dlm_sock_read((dlm_sock_t)a->sub_fd, buf, sizeof buf);
     if (got <= 0) goto closed;
     g_string_append_len(a->rx, buf, got);
 
@@ -1059,7 +1077,7 @@ static gboolean on_socket_readable(gint fd, GIOCondition cond, gpointer user)
 
 closed:
     a->sub_source = 0;
-    if (a->sub_fd >= 0) { close(a->sub_fd); a->sub_fd = -1; }
+    if (a->sub_fd >= 0) { dlm_client_close(a->sub_fd); a->sub_fd = -1; }
     schedule_reconnect(a);
     return G_SOURCE_REMOVE;
 }
@@ -1072,23 +1090,23 @@ static void connect_subscribe(App *a)
     size_t slen = strlen(sub), off = 0;
     int werr = 0;
     while (off < slen) { /* full-write: a short write must not desync the stream */
-        ssize_t w = write(a->sub_fd, sub + off, slen - off);
+        long w = dlm_sock_write((dlm_sock_t)a->sub_fd, sub + off, slen - off);
         if (w < 0) {
-            if (errno == EINTR) continue;
+            if (dlm_sock_was_intr()) continue;
             werr = 1;
             break;
         }
         off += (size_t)w;
     }
     if (werr) {
-        close(a->sub_fd);
+        dlm_client_close(a->sub_fd);
         a->sub_fd = -1;
         schedule_reconnect(a);
         return;
     }
     g_string_truncate(a->rx, 0);
-    a->sub_source = g_unix_fd_add(a->sub_fd, G_IO_IN | G_IO_HUP | G_IO_ERR,
-                                  on_socket_readable, a);
+    a->sub_source = dlm_gui_add_socket_watch(a->sub_fd, G_IO_IN | G_IO_HUP | G_IO_ERR,
+                                             on_socket_readable, a);
 }
 
 static gboolean reconnect_cb(gpointer u)
@@ -1316,8 +1334,8 @@ static void on_pkg_edit_clicked(GtkButton *b, gpointer user)
 {
     App *a = user;
     long long id = (long long)(intptr_t)g_object_get_data(G_OBJECT(b), "pid");
-    GtkPopover *pop = g_object_get_data(G_OBJECT(b), "pop");
-    if (pop) gtk_popover_popdown(pop);
+    GtkWidget *pop = gtk_widget_get_ancestor(GTK_WIDGET(b), GTK_TYPE_POPOVER);
+    if (pop) gtk_popover_popdown(GTK_POPOVER(pop));
 
     /* current values from the model */
     const char *cur_name = "", *cur_folder = "";
@@ -1460,7 +1478,7 @@ static void on_group_changed(GtkDropDown *dd, GParamSpec *ps, gpointer user)
 
 /* ---- settings (max concurrent + global speed limit) ------------------ */
 
-typedef struct { GtkEditable *jobs, *limit; } SettingsEntries;
+typedef struct { GtkEditable *jobs, *limit; GtkWidget *auto_tools; } SettingsEntries;
 
 static void on_settings_response(AdwAlertDialog *d, const char *response, gpointer user)
 {
@@ -1475,6 +1493,8 @@ static void on_settings_response(AdwAlertDialog *d, const char *response, gpoint
         /* empty / "off" / "0" clears the cap */
         int64_t bps = (lt && *lt && g_strcmp0(lt, "off")) ? dlm_parse_rate(lt) : 0;
         json_object_set_new(r, "max_speed", json_integer(bps));
+        json_object_set_new(r, "auto_tools",
+            json_boolean(gtk_switch_get_active(GTK_SWITCH(e->auto_tools))));
         char *s = json_dumps(r, JSON_COMPACT);
         json_decref(r);
         send_cmd(s);
@@ -1487,15 +1507,27 @@ static void on_settings_response(AdwAlertDialog *d, const char *response, gpoint
     g_free(e);
 }
 
-/* Query the daemon's current max_active / max_speed (0 if unavailable). */
-static void query_settings(int *max_active, gint64 *max_speed)
+/* Send a one-shot tools_update request to the daemon. */
+static void on_tools_update_clicked(GtkButton *b, gpointer user)
+{
+    (void)b; (void)user;
+    send_cmd("{\"cmd\":\"tools_update\"}");
+    toast(&g_app, "Checking yt-dlp for updates\xE2\x80\xA6");
+}
+
+/* Query the daemon's current settings, including auto-tools state and the
+ * installed yt-dlp version (ytver may be set to "" if unknown). */
+static void query_settings(int *max_active, gint64 *max_speed, int *auto_tools,
+                           char *ytver, size_t verlen)
 {
     *max_active = 0;
     *max_speed = 0;
+    *auto_tools = 1;
+    if (ytver && verlen) ytver[0] = '\0';
     int fd = dlm_client_connect();
     if (fd < 0) return;
     char *resp = dlm_client_rpc(fd, "{\"cmd\":\"list\"}");
-    close(fd);
+    dlm_client_close(fd);
     if (!resp) return;
     json_error_t e;
     json_t *root = json_loads(resp, 0, &e);
@@ -1503,6 +1535,14 @@ static void query_settings(int *max_active, gint64 *max_speed)
     if (!root) return;
     *max_active = (int)json_integer_value(json_object_get(root, "max_active"));
     *max_speed = json_integer_value(json_object_get(root, "max_speed"));
+    json_t *tools = json_object_get(root, "tools");
+    if (json_is_object(tools)) {
+        json_t *au = json_object_get(tools, "auto");
+        if (json_is_boolean(au)) *auto_tools = json_is_true(au) ? 1 : 0;
+        json_t *yt = json_object_get(tools, "yt-dlp");
+        const char *v = yt ? json_string_value(json_object_get(yt, "version")) : NULL;
+        if (v && ytver && verlen) snprintf(ytver, verlen, "%s", v);
+    }
     json_decref(root);
 }
 
@@ -1512,9 +1552,10 @@ static void on_settings_clicked(GtkButton *b, gpointer user)
     App *a = user;
     AdwDialog *d = adw_alert_dialog_new("Settings", NULL);
 
-    int cur_jobs = 0;
+    int cur_jobs = 0, cur_auto = 1;
     gint64 cur_speed = 0;
-    query_settings(&cur_jobs, &cur_speed);
+    char ytver[64] = "";
+    query_settings(&cur_jobs, &cur_speed, &cur_auto, ytver, sizeof ytver);
 
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     GtkWidget *jobs = gtk_entry_new();
@@ -1534,6 +1575,32 @@ static void on_settings_clicked(GtkButton *b, gpointer user)
     }
     gtk_box_append(GTK_BOX(box), jobs);
     gtk_box_append(GTK_BOX(box), limit);
+
+    /* --- auto-managed tools row --- */
+    gtk_box_append(GTK_BOX(box), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+    GtkWidget *trow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *tlabel = gtk_label_new("Auto-download & update yt-dlp / ffmpeg");
+    gtk_widget_set_hexpand(tlabel, TRUE);
+    gtk_label_set_xalign(GTK_LABEL(tlabel), 0.0);
+    GtkWidget *autosw = gtk_switch_new();
+    gtk_switch_set_active(GTK_SWITCH(autosw), cur_auto);
+    gtk_widget_set_valign(autosw, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(trow), tlabel);
+    gtk_box_append(GTK_BOX(trow), autosw);
+    gtk_box_append(GTK_BOX(box), trow);
+
+    GtkWidget *vrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    char vbuf[96];
+    snprintf(vbuf, sizeof vbuf, "yt-dlp version: %s", ytver[0] ? ytver : "(not installed)");
+    GtkWidget *vlabel = gtk_label_new(vbuf);
+    gtk_widget_set_hexpand(vlabel, TRUE);
+    gtk_label_set_xalign(GTK_LABEL(vlabel), 0.0);
+    GtkWidget *upd = gtk_button_new_with_label("Update now");
+    g_signal_connect(upd, "clicked", G_CALLBACK(on_tools_update_clicked), a);
+    gtk_box_append(GTK_BOX(vrow), vlabel);
+    gtk_box_append(GTK_BOX(vrow), upd);
+    gtk_box_append(GTK_BOX(box), vrow);
+
     adw_alert_dialog_set_extra_child(ADW_ALERT_DIALOG(d), box);
 
     adw_alert_dialog_add_responses(ADW_ALERT_DIALOG(d),
@@ -1544,6 +1611,7 @@ static void on_settings_clicked(GtkButton *b, gpointer user)
     SettingsEntries *e = g_new0(SettingsEntries, 1);
     e->jobs = GTK_EDITABLE(jobs);
     e->limit = GTK_EDITABLE(limit);
+    e->auto_tools = autosw;
     g_signal_connect(d, "response", G_CALLBACK(on_settings_response), e);
     adw_dialog_present(d, GTK_WIDGET(a->win));
 }

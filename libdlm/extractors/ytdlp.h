@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — yt-dlp extractor (internal). */
 #ifndef DLM_YTDLP_H
 #define DLM_YTDLP_H

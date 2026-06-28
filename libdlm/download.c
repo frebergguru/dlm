@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — segmented HTTP(S) downloader with resume.
  *
  * Strategy:
@@ -12,9 +13,12 @@
  *   4. On success the part file is renamed to the final path and the journal
  *      removed.
  */
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "dlm/dlm.h"
 #include "internal.h"
+#include "compat/compat.h"
 
 #include <ctype.h>
 #include <curl/curl.h>
@@ -22,8 +26,12 @@
 #include <fcntl.h>
 #include <jansson.h>
 #include <stdarg.h>
-#include <strings.h>
-#include <unistd.h>
+#if defined(_WIN32)
+#  include <io.h>
+#else
+#  include <strings.h>
+#  include <unistd.h>
+#endif
 
 #define DLM_UA "dlm/0.1 (+segmented-downloader)"
 #define DLM_DEFAULT_CONNS 4
@@ -226,8 +234,8 @@ static size_t seg_write_cb(char *ptr, size_t size, size_t nmemb, void *userp)
         }
     }
 
-    off_t off = (off_t)(s->start + s->done);
-    ssize_t w = pwrite(dl->fd, ptr, len, off);
+    int64_t off = (int64_t)(s->start + s->done);
+    long long w = dlm_pwrite(dl->fd, ptr, len, off);
     if (w < 0 || (size_t)w != len) {
         DLM_ERROR("pwrite failed at %lld: %s", (long long)off, strerror(errno));
         dl->io_error = 1;
@@ -299,7 +307,7 @@ static void journal_save(dlm_download_t *dl)
     char *tmp = dlm_xmalloc(strlen(dl->journal_path) + 5);
     sprintf(tmp, "%s.tmp", dl->journal_path);
     if (json_dump_file(root, tmp, JSON_COMPACT) == 0)
-        rename(tmp, dl->journal_path);
+        dlm_rename_replace(tmp, dl->journal_path);
     free(tmp);
     json_decref(root);
 }
@@ -512,13 +520,13 @@ static struct curl_slist *build_header_list(const char *const *headers)
 
 static dlm_result open_part_file(dlm_download_t *dl)
 {
-    dl->fd = open(dl->part_path, O_RDWR | O_CREAT, 0644);
+    dl->fd = open(dl->part_path, O_RDWR | O_CREAT | DLM_O_BINARY, 0644);
     if (dl->fd < 0) {
         DLM_ERROR("cannot open %s: %s", dl->part_path, strerror(errno));
         return DLM_ERR_IO;
     }
     if (dl->total > 0) {
-        if (ftruncate(dl->fd, dl->total) != 0) {
+        if (dlm_ftruncate(dl->fd, dl->total) != 0) {
             DLM_ERROR("ftruncate %s: %s", dl->part_path, strerror(errno));
             return DLM_ERR_IO;
         }
@@ -584,19 +592,19 @@ dlm_result dlm_download_file(const dlm_options *opt)
         dl.segs[0].start = 0;
         dl.segs[0].end = -1; /* no Range header (see plan_segments) so the
                               * server's 200 full-body response is accepted */
-        if (dl.total > 0) ftruncate(dl.fd, dl.total);
+        if (dl.total > 0) dlm_ftruncate(dl.fd, dl.total);
         rc = run_multi(&dl);
     }
 
     if (rc == DLM_OK && all_segments_complete(&dl)) {
-        fsync(dl.fd);
+        dlm_fsync(dl.fd);
         close(dl.fd);
         dl.fd = -1;
-        if (rename(dl.part_path, dl.out_path) != 0) {
+        if (dlm_rename_replace(dl.part_path, dl.out_path) != 0) {
             DLM_ERROR("rename %s -> %s: %s", dl.part_path, dl.out_path, strerror(errno));
             rc = DLM_ERR_IO;
         } else {
-            unlink(dl.journal_path);
+            remove(dl.journal_path);
             DLM_INFO("done: %s (%lld bytes)", dl.out_path, (long long)dl.downloaded);
         }
     } else if (rc == DLM_OK) {

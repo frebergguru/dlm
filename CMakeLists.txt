@@ -25,6 +25,9 @@ pkg_check_modules(SQLITE3 REQUIRED sqlite3)
 pkg_check_modules(PCRE2 REQUIRED libpcre2-8)
 pkg_check_modules(CRYPTO REQUIRED libcrypto)
 
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 # ---- libdlm (core engine) ------------------------------------------------
 add_library(dlm STATIC
   libdlm/util.c
@@ -33,18 +36,33 @@ add_library(dlm STATIC
   libdlm/httpget.c
   libdlm/iaauth.c
   libdlm/verify.c
+  libdlm/tools.c
   libdlm/extract.c
   libdlm/extractors/archiveorg.c
   libdlm/extractors/ytdlp.c
+  libdlm/compat/dlm_paths.c
+  libdlm/compat/dlm_misc.c
+  libdlm/compat/dlm_io.c
+  libdlm/compat/dlm_sock.c
+  libdlm/compat/dlm_proc.c
 )
-target_include_directories(dlm PUBLIC libdlm/include)
+# libdlm is PUBLIC so consumers (dlmd/cli/gui) can include "compat/compat.h".
+target_include_directories(dlm PUBLIC libdlm/include libdlm)
 target_include_directories(dlm PRIVATE
-  libdlm
   ${CURL_INCLUDE_DIRS} ${JANSSON_INCLUDE_DIRS}
   ${SQLITE3_INCLUDE_DIRS} ${PCRE2_INCLUDE_DIRS} ${CRYPTO_INCLUDE_DIRS})
 target_link_libraries(dlm PUBLIC
   ${CURL_LIBRARIES} ${JANSSON_LIBRARIES}
-  ${SQLITE3_LIBRARIES} ${PCRE2_LIBRARIES} ${CRYPTO_LIBRARIES})
+  ${SQLITE3_LIBRARIES} ${PCRE2_LIBRARIES} ${CRYPTO_LIBRARIES}
+  Threads::Threads)
+
+if(WIN32)
+  # Win10+ for AF_UNIX sockets + WSAPoll; link Winsock and shell helpers.
+  # __USE_MINGW_ANSI_STDIO makes printf honour C99 %zu/%lld (MSVCRT does not).
+  target_compile_definitions(dlm PUBLIC
+    _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN __USE_MINGW_ANSI_STDIO=1)
+  target_link_libraries(dlm PUBLIC ws2_32 shlwapi)
+endif()
 
 # ---- dlmd daemon ---------------------------------------------------------
 add_executable(dlmd
@@ -86,6 +104,9 @@ include(GNUInstallDirs)
 
 # binaries: dlm (CLI), dlmd (daemon), and dlm-gui when built
 install(TARGETS dlm-cli dlmd RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# license (GPL-3.0-or-later)
+install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/dlm)
 if(TARGET dlm-gui)
   install(TARGETS dlm-gui RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 

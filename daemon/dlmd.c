@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* dlmd — the dlm download daemon.
  *
  * Owns the queue/engine and serves an AF_UNIX JSON-lines socket. A single poll()
@@ -5,30 +6,47 @@
  * (in queue.c) perform the downloads. The loop ticks the scheduler and pushes
  * periodic progress events to subscribed clients.
  */
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "ipc.h"
 #include "queue.h"
 #include "dlm/dlm.h"
 #include "dlm/store.h"
+#include "dlm/tools.h"
+#include "compat/compat.h"
+#include "internal.h" /* dlm_now */
 
-#include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
-#include <time.h>
-#include <unistd.h>
 
 #define TICK_MS 200
 #define PROGRESS_INTERVAL 0.5
+#define TOOLS_CHECK_INTERVAL 3600.0 /* re-trigger the (weekly-gated) tool check hourly */
 
 static volatile sig_atomic_t g_stop = 0;
-static void on_signal(int s) { (void)s; g_stop = 1; }
+static void on_stop(void) { g_stop = 1; }
+
+/* The daemon owns tool management: ensure required tools exist and run the
+ * weekly yt-dlp update check on a detached thread so startup/downloads never
+ * block on the network. */
+static void *tools_thread(void *arg)
+{
+    (void)arg;
+    dlm_tools_ensure_ready(1);
+    dlm_tools_check_updates(0);
+    return NULL;
+}
+
+static void trigger_tools_check(void)
+{
+    pthread_t th;
+    if (pthread_create(&th, NULL, tools_thread, NULL) == 0)
+        pthread_detach(th);
+}
 
 /* ---- per-client buffers ----------------------------------------------- */
 
@@ -55,8 +73,11 @@ typedef struct {
 static client_t *clients_add(clients_t *c, int fd)
 {
     if (c->n == c->cap) {
-        c->cap = c->cap ? c->cap * 2 : 8;
-        c->v = realloc(c->v, (size_t)c->cap * sizeof *c->v);
+        int ncap = c->cap ? c->cap * 2 : 8;
+        client_t *nv = realloc(c->v, (size_t)ncap * sizeof *c->v);
+        if (!nv) return NULL;
+        c->v = nv;
+        c->cap = ncap;
     }
     client_t *cl = &c->v[c->n++];
     memset(cl, 0, sizeof *cl);
@@ -66,7 +87,7 @@ static client_t *clients_add(clients_t *c, int fd)
 
 static void clients_remove(clients_t *c, int idx)
 {
-    close(c->v[idx].fd);
+    dlm_sock_close((dlm_sock_t)c->v[idx].fd);
     free(c->v[idx].buf);
     free(c->v[idx].out);
     c->v[idx] = c->v[--c->n];
@@ -117,10 +138,10 @@ static void client_flush(client_t *cl)
 {
     size_t off = 0;
     while (off < cl->outlen) {
-        ssize_t w = write(cl->fd, cl->out + off, cl->outlen - off);
+        long w = dlm_sock_write((dlm_sock_t)cl->fd, cl->out + off, cl->outlen - off);
         if (w < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (dlm_sock_was_intr()) continue;
+            if (dlm_sock_would_block()) break;
             cl->gone = 1;
             break;
         }
@@ -132,69 +153,9 @@ static void client_flush(client_t *cl)
     }
 }
 
-/* ---- paths ------------------------------------------------------------ */
-
-static void mkdir_p(const char *path)
-{
-    char tmp[512];
-    snprintf(tmp, sizeof tmp, "%s", path);
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            mkdir(tmp, 0755);
-            *p = '/';
-        }
-    }
-    mkdir(tmp, 0755);
-}
-
-static void socket_path(char *buf, size_t n)
-{
-    const char *rt = getenv("XDG_RUNTIME_DIR");
-    if (rt && *rt)
-        snprintf(buf, n, "%s/dlm.sock", rt);
-    else
-        snprintf(buf, n, "/tmp/dlm-%d.sock", (int)getuid());
-}
-
-static void db_path(char *buf, size_t n)
-{
-    const char *override = getenv("DLM_DB");
-    if (override && *override) { snprintf(buf, n, "%s", override); return; }
-    const char *data = getenv("XDG_DATA_HOME");
-    char dir[400];
-    if (data && *data)
-        snprintf(dir, sizeof dir, "%s/dlm", data);
-    else
-        snprintf(dir, sizeof dir, "%s/.local/share/dlm", getenv("HOME"));
-    mkdir_p(dir);
-    snprintf(buf, n, "%s/queue.db", dir);
-}
-
-/* ---- single-instance guard ------------------------------------------- */
-
-/* Copy a path into a sockaddr_un, returning 0 if it fits, -1 otherwise. */
-static int set_sun_path(struct sockaddr_un *a, const char *path)
-{
-    size_t len = strlen(path);
-    if (len >= sizeof a->sun_path) return -1;
-    memcpy(a->sun_path, path, len + 1);
-    return 0;
-}
-
-/* Returns 1 if a daemon already accepts connections at `path`. */
-static int already_running(const char *path)
-{
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return 0;
-    struct sockaddr_un a;
-    memset(&a, 0, sizeof a);
-    a.sun_family = AF_UNIX;
-    if (set_sun_path(&a, path) != 0) { close(fd); return 0; }
-    int ok = connect(fd, (struct sockaddr *)&a, sizeof a) == 0;
-    close(fd);
-    return ok;
-}
+/* Socket address and DB path now come from the shared compat layer
+ * (dlm_socket_path / dlm_db_path), so the daemon and clients always agree. The
+ * single-instance guard is a connect-probe via dlm_unix_probe(). */
 
 /* ---- main ------------------------------------------------------------- */
 
@@ -210,77 +171,60 @@ int main(int argc, char **argv)
         }
     }
 
+    dlm_net_init();
+
     char sock_path[256], dbpath[512];
-    socket_path(sock_path, sizeof sock_path);
-    db_path(dbpath, sizeof dbpath);
+    dlm_socket_path(sock_path, sizeof sock_path);
+    dlm_db_path(dbpath, sizeof dbpath);
 
-    struct sockaddr_un szchk;
-    if (strlen(sock_path) >= sizeof szchk.sun_path) {
-        fprintf(stderr, "dlmd: socket path too long (%zu >= %zu): %s\n",
-                strlen(sock_path), sizeof szchk.sun_path, sock_path);
-        return 1;
-    }
-    (void)szchk;
-
-    if (already_running(sock_path)) {
+    if (dlm_unix_probe(sock_path)) {
         fprintf(stderr, "dlmd: already running at %s\n", sock_path);
         return 1;
     }
-    unlink(sock_path); /* clear any stale socket */
 
     dlm_global_init();
     dlm_store *store = dlm_store_open(dbpath);
     if (!store) { fprintf(stderr, "dlmd: cannot open store %s\n", dbpath); return 1; }
     dlm_queue *q = dlm_queue_create(store, max_active);
 
-    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (lfd < 0) { perror("socket"); return 1; }
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    set_sun_path(&addr, sock_path); /* length already validated above */
-    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-        perror("bind");
+    dlm_sock_t lfd = dlm_unix_listen(sock_path, 16); /* binds + listens + nonblock */
+    if (lfd == DLM_INVALID_SOCK) {
+        fprintf(stderr, "dlmd: cannot listen on %s\n", sock_path);
         return 1;
     }
-    if (listen(lfd, 16) < 0) { perror("listen"); return 1; }
-    fcntl(lfd, F_SETFL, O_NONBLOCK); /* accept() must not block the poll loop */
 
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_signal;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    signal(SIGPIPE, SIG_IGN);
+    dlm_install_term_handler(on_stop); /* SIGINT/SIGTERM (+ignore SIGPIPE) */
 
     fprintf(stderr, "dlmd: listening on %s (db %s, max_active %d)\n",
             sock_path, dbpath, max_active);
 
     clients_t clients = {0};
     double last_progress = 0;
+    double last_tools = 0;
 
     while (!g_stop) {
         int nclients = clients.n;
         int nfds = 1 + nclients;
-        struct pollfd *pfd = calloc((size_t)nfds, sizeof *pfd);
+        struct dlm_pollfd *pfd = calloc((size_t)nfds, sizeof *pfd);
+        if (!pfd) { dlm_sleep_ms(TICK_MS); continue; } /* transient OOM: retry next tick */
         pfd[0].fd = lfd;
-        pfd[0].events = POLLIN;
+        pfd[0].events = DLM_POLLIN;
         for (int i = 0; i < nclients; i++) {
-            pfd[i + 1].fd = clients.v[i].fd;
-            pfd[i + 1].events = POLLIN;
-            if (clients.v[i].outlen > 0) pfd[i + 1].events |= POLLOUT;
+            pfd[i + 1].fd = (dlm_sock_t)clients.v[i].fd;
+            pfd[i + 1].events = DLM_POLLIN;
+            if (clients.v[i].outlen > 0) pfd[i + 1].events |= DLM_POLLOUT;
         }
 
-        int r = poll(pfd, (nfds_t)nfds, TICK_MS);
-        if (r < 0 && errno != EINTR) { perror("poll"); free(pfd); break; }
+        int r = dlm_poll(pfd, (unsigned)nfds, TICK_MS);
+        if (r < 0 && !dlm_sock_was_intr()) { perror("poll"); free(pfd); break; }
 
         /* accept new connections (drain the backlog; lfd is non-blocking) */
-        if (r > 0 && (pfd[0].revents & POLLIN)) {
+        if (r > 0 && (pfd[0].revents & DLM_POLLIN)) {
             for (;;) {
-                int cfd = accept(lfd, NULL, NULL);
-                if (cfd < 0) break;
-                fcntl(cfd, F_SETFL, O_NONBLOCK);
-                clients_add(&clients, cfd);
+                dlm_sock_t cfd = dlm_sock_accept(lfd);
+                if (cfd == DLM_INVALID_SOCK) break;
+                dlm_sock_set_nonblock(cfd);
+                if (!clients_add(&clients, (int)cfd)) dlm_sock_close(cfd); /* OOM: drop */
             }
         }
 
@@ -292,15 +236,15 @@ int main(int argc, char **argv)
         for (int i = nclients - 1; i >= 0; i--) {
             client_t *cl = &clients.v[i];
             short re = pfd[i + 1].revents;
-            if (re & POLLOUT) client_flush(cl);
+            if (re & DLM_POLLOUT) client_flush(cl);
             if (cl->gone) continue;
-            if (re & (POLLHUP | POLLERR)) { cl->gone = 1; continue; }
-            if (!(re & POLLIN)) continue;
+            if (re & (DLM_POLLHUP | DLM_POLLERR)) { cl->gone = 1; continue; }
+            if (!(re & DLM_POLLIN)) continue;
 
             char tmp[4096];
-            ssize_t got = read(cl->fd, tmp, sizeof tmp);
+            long got = dlm_sock_read((dlm_sock_t)cl->fd, tmp, sizeof tmp);
             if (got <= 0) {
-                if (got == 0 || (errno != EAGAIN && errno != EINTR))
+                if (got == 0 || (!dlm_sock_would_block() && !dlm_sock_was_intr()))
                     cl->gone = 1;
                 continue;
             }
@@ -329,10 +273,16 @@ int main(int argc, char **argv)
         /* scheduler tick */
         dlm_queue_tick(q);
 
+        double now = dlm_now();
+
+        /* ensure tools at startup, then re-trigger the weekly-gated update check
+         * hourly (the check itself no-ops until the 7-day window elapses) */
+        if (now - last_tools >= TOOLS_CHECK_INTERVAL || last_tools == 0) {
+            last_tools = now;
+            trigger_tools_check();
+        }
+
         /* push progress to subscribers */
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
         if (now - last_progress >= PROGRESS_INTERVAL) {
             last_progress = now;
             int has_sub = 0;
@@ -358,12 +308,17 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "\ndlmd: shutting down (pausing %d active)\n",
             dlm_queue_active_count(q));
-    for (int i = 0; i < clients.n; i++) close(clients.v[i].fd);
+    for (int i = 0; i < clients.n; i++) {
+        dlm_sock_close((dlm_sock_t)clients.v[i].fd);
+        free(clients.v[i].buf);
+        free(clients.v[i].out);
+    }
     free(clients.v);
     dlm_queue_destroy(q); /* stops + joins workers, persists state */
     dlm_store_close(store);
-    close(lfd);
-    unlink(sock_path);
+    dlm_sock_close(lfd);
+    remove(sock_path);
+    dlm_net_cleanup();
     dlm_global_cleanup();
     return 0;
 }

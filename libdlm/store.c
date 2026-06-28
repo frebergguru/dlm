@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — sqlite-backed queue persistence. */
 #define _POSIX_C_SOURCE 200809L
 #include "dlm/store.h"
@@ -124,7 +125,7 @@ int64_t dlm_store_add_full(dlm_store *s, const dlm_store_row *row)
     sqlite3_bind_text(st, i++, row->out_path, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, i++, row->connections);
     sqlite3_bind_int(st, i++, row->delegate);
-    sqlite3_bind_int64(st, i++, row->total ? row->total : -1);
+    sqlite3_bind_int64(st, i++, row->total); /* callers pass -1 for unknown */
     sqlite3_bind_int64(st, i++, row->downloaded);
     sqlite3_bind_text(st, i++, row->state ? row->state : "queued", -1,
                       SQLITE_TRANSIENT);

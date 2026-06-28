@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Offline test: sqlite store CRUD + persistence across reopen. */
 #include "dlm/store.h"
 

@@ -1,90 +1,74 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* dlm CLI — daemon client transport. */
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "client.h"
 #include "dlm/proto.h"
+#include "compat/compat.h"
 
 #include <errno.h>
-#include <fcntl.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
-#include <time.h>
-#include <unistd.h>
 
-static void socket_path(char *buf, size_t n)
-{
-    const char *rt = getenv("XDG_RUNTIME_DIR");
-    if (rt && *rt)
-        snprintf(buf, n, "%s/dlm.sock", rt);
-    else
-        snprintf(buf, n, "/tmp/dlm-%d.sock", (int)getuid());
-}
+#if defined(_WIN32)
+#  include <io.h>
+#  define DLMD_NAME "/dlmd.exe"
+#else
+#  include <unistd.h>
+#  define DLMD_NAME "/dlmd"
+#endif
 
+/* The public API speaks in int fds; on Windows a SOCKET round-trips through int
+ * (user-mode socket handles fit), and the compat layer does the real work. */
 static int try_connect(const char *path)
 {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    struct sockaddr_un a;
-    memset(&a, 0, sizeof a);
-    a.sun_family = AF_UNIX;
-    if (strlen(path) >= sizeof a.sun_path) { /* would silently truncate */
-        close(fd);
-        return -1;
-    }
-    memcpy(a.sun_path, path, strlen(path) + 1);
-    if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0) return fd;
-    close(fd);
-    return -1;
+    dlm_net_init();
+    dlm_sock_t s = dlm_unix_connect(path);
+    return (s == DLM_INVALID_SOCK) ? -1 : (int)s;
 }
 
 /* Resolve the path to the dlmd binary that sits next to this executable. */
 static int dlmd_path(char *buf, size_t n)
 {
-    char exe[PATH_MAX];
-    ssize_t r = readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (r < 0) return -1;
-    exe[r] = '\0';
-    char *slash = strrchr(exe, '/');
-    if (!slash) return -1;
-    *slash = '\0';
-    snprintf(buf, n, "%s/dlmd", exe);
+    char dir[512];
+    if (dlm_self_dir(dir, sizeof dir) != 0) return -1;
+    snprintf(buf, n, "%s" DLMD_NAME, dir);
     return 0;
+}
+
+static int dlmd_exists(const char *path)
+{
+#if defined(_WIN32)
+    return _access(path, 0) == 0;
+#else
+    return access(path, X_OK) == 0;
+#endif
 }
 
 static int spawn_daemon(void)
 {
-    char path[PATH_MAX];
+    char path[1024];
     if (dlmd_path(path, sizeof path) != 0) return -1;
-    if (access(path, X_OK) != 0) {
+    if (!dlmd_exists(path)) {
         fprintf(stderr, "dlm: cannot find dlmd at %s\n", path);
         return -1;
     }
-    pid_t pid = fork();
-    if (pid < 0) return -1;
-    if (pid == 0) {
-        /* detach: new session, redirect std fds */
-        setsid();
-        int dn = open("/dev/null", O_RDWR);
-        if (dn >= 0) {
-            dup2(dn, 0);
-            dup2(dn, 1); /* keep stderr for logs */
-            if (dn > 2) close(dn);
-        }
-        execl(path, "dlmd", (char *)NULL);
-        _exit(127);
-    }
-    return 0;
+    const char *argv[] = {path, NULL};
+    return dlm_proc_spawn_detached(argv);
 }
 
 int dlm_client_connect_existing(void)
 {
     char path[256];
-    socket_path(path, sizeof path);
+    dlm_socket_path(path, sizeof path);
     return try_connect(path);
+}
+
+void dlm_client_close(int fd)
+{
+    if (fd >= 0) dlm_sock_close((dlm_sock_t)fd);
 }
 
 static int write_all(int fd, const char *s, size_t len);
@@ -107,8 +91,7 @@ static int spawn_and_wait(const char *path)
 {
     if (spawn_daemon() != 0) return -1;
     for (int i = 0; i < 50; i++) { /* up to ~5s */
-        struct timespec ts = {0, 100 * 1000 * 1000};
-        nanosleep(&ts, NULL);
+        dlm_sleep_ms(100);
         int fd = try_connect(path);
         if (fd >= 0) return fd;
     }
@@ -119,7 +102,7 @@ static int spawn_and_wait(const char *path)
 int dlm_client_connect(void)
 {
     char path[256];
-    socket_path(path, sizeof path);
+    dlm_socket_path(path, sizeof path);
 
     int fd = try_connect(path);
     if (fd >= 0) {
@@ -130,13 +113,12 @@ int dlm_client_connect(void)
         const char *sd = "{\"cmd\":\"shutdown\"}\n";
         write_all(fd, sd, strlen(sd));
         free(dlm_client_read_line(fd));
-        close(fd);
+        dlm_client_close(fd);
         for (int i = 0; i < 30; i++) {
-            struct timespec ts = {0, 100 * 1000 * 1000};
-            nanosleep(&ts, NULL);
+            dlm_sleep_ms(100);
             int t = try_connect(path);
             if (t < 0) break;
-            close(t);
+            dlm_client_close(t);
         }
     }
     return spawn_and_wait(path);
@@ -146,9 +128,9 @@ static int write_all(int fd, const char *s, size_t len)
 {
     size_t off = 0;
     while (off < len) {
-        ssize_t w = write(fd, s + off, len - off);
+        long w = dlm_sock_write((dlm_sock_t)fd, s + off, len - off);
         if (w < 0) {
-            if (errno == EINTR) continue;
+            if (dlm_sock_was_intr()) continue;
             return -1;
         }
         off += (size_t)w;
@@ -163,9 +145,9 @@ char *dlm_client_read_line(int fd)
     if (!buf) return NULL;
     for (;;) {
         char c;
-        ssize_t r = read(fd, &c, 1);
+        long r = dlm_sock_read((dlm_sock_t)fd, &c, 1);
         if (r < 0) {
-            if (errno == EINTR) continue;
+            if (dlm_sock_was_intr()) continue;
             free(buf);
             return NULL;
         }

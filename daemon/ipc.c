@@ -1,11 +1,43 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* dlmd — JSON-lines request handling. */
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "ipc.h"
 #include "dlm/proto.h"
+#include "dlm/tools.h"
 
 #include <jansson.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Tool status as a JSON object (or null on failure), for embedding in
+ * list/settings responses. */
+static json_t *tools_obj(void)
+{
+    char *s = NULL;
+    if (dlm_tools_status_json(&s) != 0 || !s) return json_null();
+    json_error_t e;
+    json_t *o = json_loads(s, 0, &e);
+    free(s);
+    return o ? o : json_null();
+}
+
+/* Run a forced tool update check off the poll thread. */
+static void *tools_update_thread(void *arg)
+{
+    (void)arg;
+    dlm_tools_check_updates(1);
+    return NULL;
+}
+
+static void trigger_tools_update(void)
+{
+    pthread_t th;
+    if (pthread_create(&th, NULL, tools_update_thread, NULL) == 0)
+        pthread_detach(th);
+}
 
 static json_t *snap_array(dlm_queue *q)
 {
@@ -134,6 +166,7 @@ static int parse_grab_links(json_t *arr, dlm_grab_link **out)
     json_t *o;
     json_array_foreach(arr, i, o) {
         links[i].url = json_string_value(json_object_get(o, "url"));
+        if (!links[i].url) { free(links); return -1; } /* reject url-less link */
         links[i].out_path = json_string_value(json_object_get(o, "out"));
         links[i].name = json_string_value(json_object_get(o, "name"));
         json_t *sz = json_object_get(o, "size");
@@ -203,6 +236,7 @@ char *dlm_ipc_handle(dlm_queue *q, const char *line, int *want_subscribe,
                             json_integer(dlm_queue_get_max_speed(q)));
         json_object_set_new(o, "autostart",
                             json_boolean(dlm_queue_get_global_autostart(q)));
+        json_object_set_new(o, "tools", tools_obj());
         json_object_set_new(o, "packages", pkg_array(q));
         json_object_set_new(o, "downloads", snap_array(q));
         out = dump_and_free(o);
@@ -275,6 +309,9 @@ char *dlm_ipc_handle(dlm_queue *q, const char *line, int *want_subscribe,
         json_t *as = json_object_get(req, "autostart");
         if (json_is_boolean(as))
             dlm_queue_set_global_autostart(q, json_is_true(as) ? 1 : 0);
+        json_t *at = json_object_get(req, "auto_tools");
+        if (json_is_boolean(at))
+            dlm_tools_set_auto_enabled(json_is_true(at) ? 1 : 0);
         json_t *o = json_object();
         json_object_set_new(o, "ok", json_true());
         json_object_set_new(o, "max_active",
@@ -283,7 +320,11 @@ char *dlm_ipc_handle(dlm_queue *q, const char *line, int *want_subscribe,
                             json_integer(dlm_queue_get_max_speed(q)));
         json_object_set_new(o, "autostart",
                             json_boolean(dlm_queue_get_global_autostart(q)));
+        json_object_set_new(o, "tools", tools_obj());
         out = dump_and_free(o);
+    } else if (!strcmp(cmd, "tools_update")) {
+        trigger_tools_update();
+        out = dump_and_free(json_pack("{s:b}", "ok", 1));
     } else if (!strcmp(cmd, "subscribe")) {
         if (want_subscribe) *want_subscribe = 1;
         json_t *o = json_object();

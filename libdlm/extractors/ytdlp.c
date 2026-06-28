@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — yt-dlp extractor.
  *
  * For any URL not handled natively, we shell out to yt-dlp to resolve the page
@@ -15,14 +16,11 @@
 #define _POSIX_C_SOURCE 200809L
 #include "ytdlp.h"
 #include "dlm/dlm.h"
+#include "dlm/tools.h"
 #include "internal.h"
+#include "compat/compat.h"
 
 #include <jansson.h>
-#include <spawn.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-extern char **environ;
 
 /* ---- helpers ---------------------------------------------------------- */
 
@@ -118,7 +116,9 @@ static int task_from_info(json_t *info, const char *input_url, dlm_task *t)
         }
     } else {
         /* fragmented / merge / unknown: hand back to yt-dlp */
-        t->url = dlm_xstrdup(page ? page : input_url);
+        const char *du = page ? page : input_url;
+        if (!du) { free(t->filename); t->filename = NULL; return -1; } /* nothing to delegate */
+        t->url = dlm_xstrdup(du);
         t->delegate = 1;
         t->size = -1;
     }
@@ -146,13 +146,14 @@ int dlm_ytdlp_parse(const char *json_text, const char *input_url,
         size_t idx;
         json_t *ent;
         json_array_foreach(entries, idx, ent) {
-            if (json_is_object(ent))
-                task_from_info(ent, input_url, &out->tasks[out->count++]);
+            if (json_is_object(ent) &&
+                task_from_info(ent, input_url, &out->tasks[out->count]) == 0)
+                out->count++;
         }
     } else {
         out->tasks = dlm_xcalloc(1, sizeof *out->tasks);
-        task_from_info(root, input_url, &out->tasks[0]);
-        out->count = 1;
+        if (task_from_info(root, input_url, &out->tasks[0]) == 0)
+            out->count = 1;
     }
     json_decref(root);
 
@@ -165,22 +166,9 @@ int dlm_ytdlp_parse(const char *json_text, const char *input_url,
 /* Run yt-dlp with the given args, capturing stdout into a malloc'd string. */
 static int run_capture(const char *const argv[], char **out, int *exit_code)
 {
-    int pipefd[2];
-    if (pipe(pipefd) != 0) return -1;
-
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addclose(&fa, pipefd[0]);
-    posix_spawn_file_actions_addclose(&fa, pipefd[1]);
-
-    pid_t pid;
-    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, (char *const *)argv, environ);
-    posix_spawn_file_actions_destroy(&fa);
-    close(pipefd[1]);
-    if (rc != 0) {
-        close(pipefd[0]);
-        DLM_ERROR("yt-dlp: cannot spawn (is it installed?): %s", strerror(rc));
+    dlm_proc *p = dlm_proc_spawn(argv, DLM_SPAWN_STDOUT);
+    if (!p) {
+        DLM_ERROR("yt-dlp: cannot spawn (is it installed?)");
         return -1;
     }
 
@@ -189,10 +177,11 @@ static int run_capture(const char *const argv[], char **out, int *exit_code)
     const size_t MAX_CAPTURE = (size_t)256 * 1024 * 1024;
     size_t cap = 65536, len = 0;
     char *buf = dlm_xmalloc(cap);
-    ssize_t got;
     char tmp[8192];
     int too_big = 0;
-    while ((got = read(pipefd[0], tmp, sizeof tmp)) > 0) {
+    long got;
+    while ((got = dlm_proc_read(p, tmp, sizeof tmp, -1)) != 0) {
+        if (got < 0) continue;
         size_t need = len + (size_t)got + 1;
         if (need > MAX_CAPTURE) { too_big = 1; break; }
         if (need > cap) {
@@ -202,26 +191,28 @@ static int run_capture(const char *const argv[], char **out, int *exit_code)
         memcpy(buf + len, tmp, (size_t)got);
         len += (size_t)got;
     }
-    close(pipefd[0]); /* closing early makes the child see EPIPE and exit */
     buf[len] = '\0';
 
-    int status = 0;
-    waitpid(pid, &status, 0);
+    if (too_big) dlm_proc_terminate(p);
+    int ec = -1;
+    dlm_proc_wait(p, &ec);
+    dlm_proc_free(p);
     if (too_big) {
         DLM_ERROR("yt-dlp: output exceeded %zu bytes; aborting", MAX_CAPTURE);
         free(buf);
         *out = NULL;
         return -1;
     }
-    if (exit_code) *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (exit_code) *exit_code = ec;
     *out = buf;
     return 0;
 }
 
 int dlm_extract_ytdlp(const char *url, dlm_extract_result *out)
 {
-    const char *argv[] = {"yt-dlp", "-J", "--no-warnings", "--no-playlist",
-                          "--", url, NULL};
+    dlm_tools_ensure_ready(1); /* fetch yt-dlp on first use if missing */
+    const char *argv[] = {dlm_tool_path("yt-dlp"), "-J", "--no-warnings",
+                          "--no-playlist", "--", url, NULL};
     char *json = NULL;
     int ec = 0;
     if (run_capture(argv, &json, &ec) != 0) {

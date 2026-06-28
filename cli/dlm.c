@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* dlm — command-line client.
  *
  *   dlm get <url> [-o out] [-c n]   download directly (in-process, no daemon)
@@ -8,29 +9,32 @@
  *   dlm set -j <n>                  set max concurrent downloads
  *   dlm version
  */
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "client.h"
 #include "dlm/dlm.h"
 #include "dlm/extract.h"
 #include "dlm/iaauth.h"
+#include "dlm/tools.h"
 #include "dlm/verify.h"
+#include "compat/compat.h"
 
 #include <jansson.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
-#include <termios.h>
 #include <time.h>
-#include <unistd.h>
+#if !defined(_WIN32)
+#  include <strings.h>
+#  include <unistd.h>
+#endif
 
 /* ===================== direct (in-process) get ======================== */
 
 static volatile int g_cancel = 0;
-static void on_sigint(int s) { (void)s; g_cancel = 1; }
+static void on_cancel(void) { g_cancel = 1; }
 
 static void human(double n, char *buf, size_t len)
 {
@@ -47,6 +51,7 @@ static void default_download_dir(char *buf, size_t len)
     const char *env = getenv("DLM_DOWNLOAD_DIR");
     if (env && *env) { snprintf(buf, len, "%s", env); return; }
     const char *home = getenv("HOME");
+    if (!home || !*home) home = getenv("USERPROFILE"); /* Windows */
     if (home && *home) {
         char dl[1024];
         snprintf(dl, sizeof dl, "%s/Downloads", home);
@@ -96,14 +101,18 @@ static const char *merge_ext(const char *out_path)
 static int delegate_to_ytdlp(const dlm_task *t, const char *out_path, int64_t limit)
 {
     fprintf(stderr, "dlm: stream -> delegating to yt-dlp: %s -> %s\n", t->url, out_path);
+    dlm_tools_ensure_ready(1); /* fetch yt-dlp/ffmpeg on first use if missing */
 
-    /* build argv dynamically: base + optional --limit-rate + optional
-     * --merge-output-format so the final file matches the requested name */
-    const char *argv[16];
+    /* build argv dynamically: base + optional ffmpeg location + optional
+     * --limit-rate + optional --merge-output-format so the final file matches
+     * the requested name */
+    const char *argv[20];
     int n = 0;
-    argv[n++] = "yt-dlp";
+    argv[n++] = dlm_tool_path("yt-dlp");
     argv[n++] = "--no-warnings";
     argv[n++] = "--no-playlist";
+    const char *ffdir = dlm_tool_ffmpeg_dir();
+    if (ffdir) { argv[n++] = "--ffmpeg-location"; argv[n++] = ffdir; }
     char rate[32];
     if (limit > 0) {
         snprintf(rate, sizeof rate, "%lld", (long long)limit);
@@ -121,16 +130,11 @@ static int delegate_to_ytdlp(const dlm_task *t, const char *out_path, int64_t li
     argv[n++] = t->url;
     argv[n] = NULL;
 
-    pid_t pid = fork();
-    if (pid < 0) { perror("fork"); return 1; }
-    if (pid == 0) {
-        execvp("yt-dlp", (char *const *)argv);
-        fprintf(stderr, "dlm: cannot exec yt-dlp (is it installed?)\n");
-        _exit(127);
-    }
-    int status = 0;
-    waitpid(pid, &status, 0);
-    int ec = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    dlm_proc *p = dlm_proc_spawn(argv, DLM_SPAWN_INHERIT);
+    if (!p) { fprintf(stderr, "dlm: cannot exec yt-dlp (is it installed?)\n"); return 1; }
+    int ec = -1;
+    dlm_proc_wait(p, &ec);
+    dlm_proc_free(p);
     if (ec != 0) fprintf(stderr, "dlm: yt-dlp exited %d\n", ec);
     return ec == 0 ? 0 : 1;
 }
@@ -194,7 +198,7 @@ static int cmd_get(int argc, char **argv)
         return 2;
     }
 
-    signal(SIGINT, on_sigint);
+    dlm_install_term_handler(on_cancel);
     if (limit > 0) {
         char rb[32];
         dlm_format_rate(limit, rb, sizeof rb);
@@ -214,7 +218,7 @@ static int cmd_get(int argc, char **argv)
     } else {
         /* one or more files: place them under the chosen directory */
         const char *d = dir ? dir : ".";
-        if (strcmp(d, ".") != 0) mkdir(d, 0755);
+        if (strcmp(d, ".") != 0) dlm_mkdir_p(d);
         if (res.count > 1)
             fprintf(stderr, "dlm: %s -> %d files into %s/\n", res.source, res.count, d);
         int okc = 0;
@@ -261,17 +265,7 @@ static int cmd_resolve(int argc, char **argv)
 
 static char *prompt_hidden(const char *prompt)
 {
-    fprintf(stderr, "%s", prompt);
-    fflush(stderr);
-    struct termios old, no;
-    int have_tty = tcgetattr(STDIN_FILENO, &old) == 0;
-    if (have_tty) { no = old; no.c_lflag &= ~(tcflag_t)ECHO; tcsetattr(STDIN_FILENO, TCSAFLUSH, &no); }
-    char buf[512];
-    char *r = fgets(buf, sizeof buf, stdin);
-    if (have_tty) { tcsetattr(STDIN_FILENO, TCSAFLUSH, &old); fputc('\n', stderr); }
-    if (!r) return NULL;
-    buf[strcspn(buf, "\r\n")] = '\0';
-    return strdup(buf);
+    return dlm_prompt_hidden(prompt);
 }
 
 static int cmd_ia_status(void)
@@ -332,7 +326,7 @@ static int cmd_shutdown(void)
     if (fd < 0) { printf("daemon not running\n"); return 0; }
     char *resp = dlm_client_rpc(fd, "{\"cmd\":\"shutdown\"}");
     free(resp);
-    close(fd);
+    dlm_client_close(fd);
     printf("daemon shutting down\n");
     return 0;
 }
@@ -343,21 +337,20 @@ static int cmd_restart(void)
     if (fd >= 0) {
         char *resp = dlm_client_rpc(fd, "{\"cmd\":\"shutdown\"}");
         free(resp);
-        close(fd);
+        dlm_client_close(fd);
         /* wait for the old socket to disappear */
         for (int i = 0; i < 30; i++) {
-            struct timespec ts = {0, 100 * 1000 * 1000};
-            nanosleep(&ts, NULL);
+            dlm_sleep_ms(100);
             int t = dlm_client_connect_existing();
             if (t < 0) break;
-            close(t);
+            dlm_client_close(t);
         }
     }
     fd = dlm_client_connect(); /* spawns a fresh daemon */
     if (fd < 0) { fprintf(stderr, "dlm: could not start daemon\n"); return 1; }
     char *resp = dlm_client_rpc(fd, "{\"cmd\":\"ping\"}");
     free(resp);
-    close(fd);
+    dlm_client_close(fd);
     printf("daemon restarted\n");
     return 0;
 }
@@ -391,7 +384,7 @@ static int rpc_simple(const char *req)
     int fd = dlm_client_connect();
     if (fd < 0) return 1;
     json_t *root = parse_resp(dlm_client_rpc(fd, req));
-    close(fd);
+    dlm_client_close(fd);
     if (!root) return 1;
     int ok = check_ok(root);
     json_decref(root);
@@ -446,7 +439,7 @@ static int cmd_add(int argc, char **argv)
     /* destination directory: -d, else the default download dir */
     char dbuf[1024];
     if (!dir) { default_download_dir(dbuf, sizeof dbuf); dir = dbuf; }
-    if (strcmp(dir, ".") != 0) mkdir(dir, 0755);
+    if (strcmp(dir, ".") != 0) dlm_mkdir_p(dir);
 
     int fd = dlm_client_connect();
     if (fd < 0) { dlm_extract_result_free(&res); return 1; }
@@ -460,7 +453,7 @@ static int cmd_add(int argc, char **argv)
             snprintf(path, sizeof path, "%s/%s", dir, res.tasks[i].filename);
         added += send_add(fd, res.tasks[i].url, path, conns, res.tasks[i].delegate);
     }
-    close(fd);
+    dlm_client_close(fd);
     if (res.count == 1)
         printf("added 1 download (%s) to %s\n", res.source, dir);
     else
@@ -659,7 +652,7 @@ static int cmd_ls(void)
     int fd = dlm_client_connect();
     if (fd < 0) return 1;
     json_t *root = parse_resp(dlm_client_rpc(fd, "{\"cmd\":\"list\"}"));
-    close(fd);
+    dlm_client_close(fd);
     if (!root) return 1;
     int rc = 1;
     if (check_ok(root)) {
@@ -683,7 +676,7 @@ static int cmd_lg(void)
     int fd = dlm_client_connect();
     if (fd < 0) return 1;
     json_t *root = parse_resp(dlm_client_rpc(fd, "{\"cmd\":\"list\"}"));
-    close(fd);
+    dlm_client_close(fd);
     if (!root) return 1;
     int rc = 1;
     if (check_ok(root)) {
@@ -699,7 +692,7 @@ static int cmd_watch(void)
 {
     int fd = dlm_client_connect();
     if (fd < 0) return 1;
-    signal(SIGINT, on_sigint);
+    dlm_install_term_handler(on_cancel);
     char *resp = dlm_client_rpc(fd, "{\"cmd\":\"subscribe\"}");
     json_t *root = parse_resp(resp);
     if (root) { render_downloads(root, "download", 1); json_decref(root); }
@@ -715,7 +708,7 @@ static int cmd_watch(void)
             json_decref(ev);
         }
     }
-    close(fd);
+    dlm_client_close(fd);
     return 0;
 }
 
@@ -737,7 +730,7 @@ static int send_req(json_t *req, const char *count_key, const char *verb)
     if (fd < 0) { free(s); return 1; }
     json_t *root = parse_resp(dlm_client_rpc(fd, s));
     free(s);
-    close(fd);
+    dlm_client_close(fd);
     if (!root) return 1;
     int rc = 1;
     if (check_ok(root)) {

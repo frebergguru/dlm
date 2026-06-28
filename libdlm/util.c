@@ -1,10 +1,16 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — logging and small utility helpers. */
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "dlm/dlm.h"
 #include "internal.h"
 
 #include <ctype.h>
 #include <stdarg.h>
+#if defined(_WIN32)
+#  include <windows.h>
+#endif
 
 /* ---- logging ---------------------------------------------------------- */
 
@@ -26,13 +32,25 @@ dlm_log_level dlm_log_threshold(void)
 void dlm_logf(dlm_log_level lvl, const char *fmt, ...)
 {
     static const char *names[] = {"ERROR", "WARN", "INFO", "DEBUG"};
+    time_t secs;
+    long msec;
+    struct tm tm;
+#if defined(_WIN32)
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    secs = time(NULL);
+    localtime_s(&tm, &secs);
+    msec = st.wMilliseconds;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm tm;
-    localtime_r(&ts.tv_sec, &tm);
+    secs = ts.tv_sec;
+    localtime_r(&secs, &tm);
+    msec = ts.tv_nsec / 1000000L;
+#endif
     char tbuf[32];
     strftime(tbuf, sizeof tbuf, "%H:%M:%S", &tm);
-    fprintf(stderr, "%s.%03ld [%-5s] ", tbuf, ts.tv_nsec / 1000000L, names[lvl]);
+    fprintf(stderr, "%s.%03ld [%-5s] ", tbuf, msec, names[lvl]);
 
     va_list ap;
     va_start(ap, fmt);
@@ -83,9 +101,16 @@ char *dlm_xstrdup(const char *s)
 
 double dlm_now(void)
 {
+#if defined(_WIN32)
+    LARGE_INTEGER freq, ctr;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&ctr);
+    return (double)ctr.QuadPart / (double)freq.QuadPart;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#endif
 }
 
 /* ---- url -> filename -------------------------------------------------- */

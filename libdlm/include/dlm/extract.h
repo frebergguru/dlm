@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — URL extraction.
  *
  * An extractor turns a user-supplied URL (a web page, an archive.org item, or a

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* dlm — IPC protocol version.
  *
  * Bump this whenever the daemon's wire protocol or download semantics change in

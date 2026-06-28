@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — native archive.org extractor (internal). */
 #ifndef DLM_ARCHIVEORG_H
 #define DLM_ARCHIVEORG_H

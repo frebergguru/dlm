@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — internal HTTP GET/POST-to-memory helper. */
 #ifndef DLM_HTTPGET_H
 #define DLM_HTTPGET_H

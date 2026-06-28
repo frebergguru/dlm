@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Offline test: the JSON-lines IPC dispatch (dlm_ipc_handle) against a real
  * queue, with no socket or separate process. Verifies the request->queue->
  * response path for every command. */

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* libdlm — small HTTP GET/POST-to-memory helper used by extractors and auth. */
 #define _POSIX_C_SOURCE 200809L
 #include "httpget.h"
@@ -26,11 +27,19 @@ static size_t write_mem(char *ptr, size_t size, size_t nmemb, void *userp)
     return add;
 }
 
-static struct curl_slist *build_list(const char *const *headers)
+/* Build a curl header list. *ok is set to 0 if an append fails (OOM): callers
+ * must abort rather than silently send the request with headers dropped (which
+ * for archive.org would downgrade an authenticated request to anonymous). */
+static struct curl_slist *build_list(const char *const *headers, int *ok)
 {
+    *ok = 1;
     struct curl_slist *l = NULL;
     if (!headers) return NULL;
-    for (int i = 0; headers[i]; i++) l = curl_slist_append(l, headers[i]);
+    for (int i = 0; headers[i]; i++) {
+        struct curl_slist *nl = curl_slist_append(l, headers[i]);
+        if (!nl) { curl_slist_free_all(l); *ok = 0; return NULL; }
+        l = nl;
+    }
     return l;
 }
 
@@ -43,7 +52,9 @@ static int http_do(const char *url, const char *post_fields,
     if (!c) return DLM_ERR_NOMEM;
 
     membuf m = {NULL, 0};
-    struct curl_slist *hl = build_list(headers);
+    int hl_ok = 1;
+    struct curl_slist *hl = build_list(headers, &hl_ok);
+    if (!hl_ok) { curl_easy_cleanup(c); return DLM_ERR_NOMEM; }
 
     curl_easy_setopt(c, CURLOPT_URL, url);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);

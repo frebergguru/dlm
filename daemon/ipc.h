@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* dlmd — JSON-lines request handling.
  *
  * The wire protocol is one JSON object per line over an AF_UNIX stream socket.
