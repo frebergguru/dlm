@@ -18,6 +18,13 @@
 #include <string.h>
 #include <unistd.h>
 
+/* libdlm/httpget.c — declared here to avoid pulling in the private header. */
+int dlm_http_get_blob(const char *url, const char *const *headers, char **body,
+                      size_t *len, long *status);
+
+/* How the linkgrabber groups links. */
+enum { GROUP_SITE_PKG = 0, GROUP_SITE, GROUP_PKG };
+
 /* ---- model ------------------------------------------------------------ */
 
 typedef struct {
@@ -33,6 +40,7 @@ typedef struct {
     int force;
     char *list;            /* "download" | "linkgrabber" */
     char *availability;    /* "online" | "offline" | "unknown" */
+    char *url;             /* source URL (for site grouping / favicon) */
 } Dl;
 
 typedef struct {
@@ -65,6 +73,12 @@ typedef struct {
     gint64 max_speed;
     int autostart;          /* global Start/Stop state */
     char *download_dir;     /* remembered destination folder */
+    GdkClipboard *clip;     /* display clipboard (for the auto-paste monitor) */
+    gulong clip_handler;    /* "changed" handler id; 0 when monitoring is off */
+    char *clip_last;        /* last URL auto-grabbed, to suppress duplicates */
+    int group_mode;         /* GROUP_SITE_PKG | GROUP_SITE | GROUP_PKG */
+    char **csites;          /* client-side collapsed site hosts (linkgrabber) */
+    int ncsites;
 } App;
 
 static App g_app;
@@ -242,6 +256,245 @@ static const char *current_filter(App *a)
 }
 
 static void on_pkg_edit_clicked(GtkButton *b, gpointer u); /* fwd */
+static void rebuild_list(App *a);                          /* fwd */
+
+/* ---- site grouping: host / name / favicon ---------------------------- */
+
+/* Extract the bare host from a URL into `buf` (scheme, userinfo, port and path
+ * stripped; leading "www." dropped). Empty for schemeless URLs like magnet:. */
+static void host_of(const char *url, char *buf, size_t len)
+{
+    if (len) buf[0] = '\0';
+    if (!url || !len) return;
+    const char *p = strstr(url, "://");
+    p = p ? p + 3 : url;
+    const char *slash = strchr(p, '/');
+    const char *at = strchr(p, '@');
+    if (at && (!slash || at < slash)) p = at + 1;      /* drop user:pass@ */
+    size_t i = 0;
+    while (*p && *p != '/' && *p != ':' && *p != '?' && *p != '#' && i < len - 1)
+        buf[i++] = (char)g_ascii_tolower((guchar)*p++);
+    buf[i] = '\0';
+    if (g_str_has_prefix(buf, "www.")) memmove(buf, buf + 4, strlen(buf + 4) + 1);
+}
+
+/* A human-friendly display name for a host (falls back to the host itself). */
+static const char *site_label(const char *host)
+{
+    if (!host || !*host) return "Other links";
+    if (strstr(host, "archive.org")) return "Internet Archive";
+    if (strstr(host, "youtube") || strstr(host, "youtu.be") ||
+        strstr(host, "ytimg") || strstr(host, "googlevideo")) return "YouTube";
+    if (strstr(host, "vimeo")) return "Vimeo";
+    if (strstr(host, "soundcloud")) return "SoundCloud";
+    if (!strcmp(host, "magnet")) return "Magnet links";
+    return host;
+}
+
+/* ---- favicon fetch + cache (async, off the UI thread) ---------------- */
+
+/* host -> state: GINT 1 = fetch in flight, 2 = gave up (no usable icon). */
+static GHashTable *favicon_state;
+
+static char *favicon_cache_path(const char *host)
+{
+    char safe[256];
+    size_t i = 0;
+    for (const char *p = host; *p && i < sizeof safe - 1; p++)
+        safe[i++] = (g_ascii_isalnum(*p) || *p == '.' || *p == '-') ? *p : '_';
+    safe[i] = '\0';
+    char *dir = g_build_filename(g_get_user_cache_dir(), "dlm", "favicons", NULL);
+    char *path = g_strdup_printf("%s/%s.ico", dir, safe);
+    g_free(dir);
+    return path;
+}
+
+/* Worker thread: fetch https://host/favicon.ico into the cache file. */
+static void favicon_worker(GTask *task, gpointer src, gpointer data, GCancellable *c)
+{
+    (void)src; (void)c;
+    const char *host = data;
+    char url[512];
+    snprintf(url, sizeof url, "https://%s/favicon.ico", host);
+    char *body = NULL; size_t len = 0; long st = 0;
+    gboolean ok = FALSE;
+    if (dlm_http_get_blob(url, NULL, &body, &len, &st) == 0 &&
+        st >= 200 && st < 300 && len > 0) {
+        char *path = favicon_cache_path(host);
+        char *dir = g_path_get_dirname(path);
+        g_mkdir_with_parents(dir, 0700);
+        ok = g_file_set_contents(path, body, (gssize)len, NULL);
+        g_free(dir);
+        g_free(path);
+    }
+    g_free(body);
+    g_task_return_boolean(task, ok);
+}
+
+/* Try to load the cached icon into `img`; returns FALSE if missing/unusable. */
+static gboolean favicon_load(GtkImage *img, const char *host)
+{
+    char *path = favicon_cache_path(host);
+    gboolean ok = FALSE;
+    if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+        /* GdkPixbuf handles .ico (and scaling) more reliably than GdkTexture */
+        GdkPixbuf *pb = gdk_pixbuf_new_from_file_at_size(path, 24, 24, NULL);
+        if (pb) {
+G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+            GdkTexture *tex = gdk_texture_new_for_pixbuf(pb);
+G_GNUC_END_IGNORE_DEPRECATIONS
+            gtk_image_set_from_paintable(img, GDK_PAINTABLE(tex));
+            g_object_unref(tex);
+            g_object_unref(pb);
+            ok = TRUE;
+        }
+    }
+    g_free(path);
+    return ok;
+}
+
+static void favicon_fetched(GObject *src, GAsyncResult *res, gpointer user)
+{
+    (void)src;
+    GtkImage *img = GTK_IMAGE(user);            /* held with a ref until now */
+    const char *host = g_object_get_data(G_OBJECT(img), "host");
+    gboolean ok = g_task_propagate_boolean(G_TASK(res), NULL);
+    if (ok && favicon_load(img, host))
+        g_hash_table_remove(favicon_state, host);                 /* cached now */
+    else
+        g_hash_table_replace(favicon_state, g_strdup(host), GINT_TO_POINTER(2));
+    g_object_unref(img);
+}
+
+/* A 24px site icon: cached favicon if available, otherwise a generic globe
+ * with a one-shot background fetch kicked off for next time. */
+static GtkWidget *make_site_icon(const char *host)
+{
+    GtkWidget *img = gtk_image_new_from_icon_name("emblem-web-symbolic");
+    gtk_image_set_pixel_size(GTK_IMAGE(img), 24);
+    if (!host || !*host) return img;
+
+    if (favicon_load(GTK_IMAGE(img), host)) return img;
+
+    if (!favicon_state)
+        favicon_state = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    /* skip if a fetch is already running or we previously gave up */
+    if (g_hash_table_contains(favicon_state, host)) return img;
+    g_hash_table_replace(favicon_state, g_strdup(host), GINT_TO_POINTER(1));
+
+    g_object_set_data_full(G_OBJECT(img), "host", g_strdup(host), g_free);
+    GTask *t = g_task_new(NULL, NULL, favicon_fetched, g_object_ref(img));
+    g_task_set_task_data(t, g_strdup(host), g_free);
+    g_task_run_in_thread(t, favicon_worker);
+    g_object_unref(t);
+    return img;
+}
+
+/* ---- client-side site collapse + per-site actions -------------------- */
+
+static int site_collapsed(App *a, const char *host)
+{
+    for (int i = 0; i < a->ncsites; i++)
+        if (!strcmp(a->csites[i], host)) return 1;
+    return 0;
+}
+
+static void site_collapse_toggle(App *a, const char *host)
+{
+    for (int i = 0; i < a->ncsites; i++)
+        if (!strcmp(a->csites[i], host)) {            /* expand: drop it */
+            g_free(a->csites[i]);
+            a->csites[i] = a->csites[--a->ncsites];
+            return;
+        }
+    a->csites = g_realloc(a->csites, (size_t)(a->ncsites + 1) * sizeof *a->csites);
+    a->csites[a->ncsites++] = g_strdup(host);          /* collapse: add it */
+}
+
+static void on_site_collapse(GtkButton *b, gpointer user)
+{
+    App *a = user;
+    const char *host = g_object_get_data(G_OBJECT(b), "host");
+    site_collapse_toggle(a, host ? host : "");
+    rebuild_list(a);
+}
+
+/* Confirm every linkgrabber link whose host matches, into the queue. */
+static void on_site_confirm(GtkButton *b, gpointer user)
+{
+    App *a = user;
+    const char *host = g_object_get_data(G_OBJECT(b), "host");
+    if (!host) return;
+    int n = 0;
+    for (int i = 0; i < a->n; i++) {
+        Dl *d = &a->items[i];
+        if (!d->list || strcmp(d->list, "linkgrabber")) continue;
+        char h[256]; host_of(d->url, h, sizeof h);
+        if (strcmp(h, host)) continue;
+        char cmd[128];
+        snprintf(cmd, sizeof cmd,
+                 "{\"cmd\":\"confirm\",\"id\":%lld,\"start\":true}", d->id);
+        send_cmd(cmd);
+        n++;
+    }
+    char msg[96];
+    snprintf(msg, sizeof msg, "Confirmed %d link%s from %s", n,
+             n == 1 ? "" : "s", site_label(host));
+    toast(a, msg);
+}
+
+/* A site group header: favicon, friendly name, link count, collapse + confirm. */
+static GtkWidget *make_site_header(App *a, const char *host, int count)
+{
+    GtkWidget *row = gtk_list_box_row_new();
+    gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_top(outer, 6);
+    gtk_widget_set_margin_bottom(outer, 6);
+    gtk_widget_set_margin_start(outer, 8);
+    gtk_widget_set_margin_end(outer, 12);
+    gtk_widget_add_css_class(outer, "toolbar");
+
+    int collapsed = site_collapsed(a, host);
+    GtkWidget *ct = gtk_button_new_from_icon_name(
+        collapsed ? "pan-end-symbolic" : "pan-down-symbolic");
+    gtk_widget_add_css_class(ct, "flat");
+    gtk_widget_set_tooltip_text(ct, collapsed ? "Expand" : "Collapse");
+    g_object_set_data_full(G_OBJECT(ct), "host", g_strdup(host), g_free);
+    g_signal_connect(ct, "clicked", G_CALLBACK(on_site_collapse), a);
+    gtk_box_append(GTK_BOX(outer), ct);
+
+    gtk_box_append(GTK_BOX(outer), make_site_icon(host));
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_hexpand(vbox, TRUE);
+    GtkWidget *name = gtk_label_new(site_label(host));
+    gtk_label_set_xalign(GTK_LABEL(name), 0.0);
+    gtk_label_set_ellipsize(GTK_LABEL(name), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_widget_add_css_class(name, "heading");
+    gtk_box_append(GTK_BOX(vbox), name);
+    char sub[96];
+    snprintf(sub, sizeof sub, "%s · %d link%s",
+             host && *host ? host : "—", count, count == 1 ? "" : "s");
+    GtkWidget *subl = gtk_label_new(sub);
+    gtk_label_set_xalign(GTK_LABEL(subl), 0.0);
+    gtk_label_set_ellipsize(GTK_LABEL(subl), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_widget_add_css_class(subl, "dim-label");
+    gtk_widget_add_css_class(subl, "caption");
+    gtk_box_append(GTK_BOX(vbox), subl);
+    gtk_box_append(GTK_BOX(outer), vbox);
+
+    GtkWidget *confirm = gtk_button_new_from_icon_name("object-select-symbolic");
+    gtk_widget_add_css_class(confirm, "flat");
+    gtk_widget_set_valign(confirm, GTK_ALIGN_CENTER);
+    gtk_widget_set_tooltip_text(confirm, "Confirm all links from this site");
+    g_object_set_data_full(G_OBJECT(confirm), "host", g_strdup(host), g_free);
+    g_signal_connect(confirm, "clicked", G_CALLBACK(on_site_confirm), a);
+    gtk_box_append(GTK_BOX(outer), confirm);
+
+    gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), outer);
+    return row;
+}
 
 /* One download/linkgrabber link row, with all per-link queue actions. */
 static GtkWidget *make_row(Dl *d, int linkgrabber)
@@ -457,16 +710,34 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber)
     return row;
 }
 
-static void render_into(App *a, GtkListBox *list, const char *view,
-                        const char *filter)
+/* True if `d` belongs to a package that lives in `view`. */
+static int item_has_pkg(App *a, Dl *d, const char *view)
 {
-    GtkWidget *child;
-    while ((child = gtk_widget_get_first_child(GTK_WIDGET(list))))
-        gtk_list_box_remove(list, child);
+    for (int pi = 0; pi < a->npkg; pi++)
+        if (a->pkgs[pi].id == d->package_id && a->pkgs[pi].list &&
+            !strcmp(a->pkgs[pi].list, view)) return 1;
+    return 0;
+}
 
-    int linkgrabber = !strcmp(view, "linkgrabber");
+/* Host of a package = host of its first link in `view` (packages are
+ * single-site in practice, since each grab stages one source URL). */
+static void pkg_host(App *a, Pkg *p, const char *view, char *buf, size_t len)
+{
+    if (len) buf[0] = '\0';
+    for (int i = 0; i < a->n; i++) {
+        Dl *d = &a->items[i];
+        if (d->package_id == p->id && d->list && !strcmp(d->list, view)) {
+            host_of(d->url, buf, len);
+            return;
+        }
+    }
+}
+
+/* Classic package grouping (used for the downloads view and "Packages" mode). */
+static int render_pkg_view(App *a, GtkListBox *list, const char *view,
+                           const char *filter, int linkgrabber)
+{
     int shown = 0;
-
     /* packaged links (packages already arrive position-sorted) */
     for (int pi = 0; pi < a->npkg; pi++) {
         Pkg *p = &a->pkgs[pi];
@@ -485,15 +756,98 @@ static void render_into(App *a, GtkListBox *list, const char *view,
     for (int i = 0; i < a->n; i++) {
         Dl *d = &a->items[i];
         if (!d->list || strcmp(d->list, view)) continue;
-        int has_pkg = 0;
-        for (int pi = 0; pi < a->npkg; pi++)
-            if (a->pkgs[pi].id == d->package_id && a->pkgs[pi].list &&
-                !strcmp(a->pkgs[pi].list, view)) { has_pkg = 1; break; }
-        if (has_pkg) continue;
+        if (item_has_pkg(a, d, view)) continue;
         if (!linkgrabber && filter && (!d->state || strcmp(d->state, filter))) continue;
         gtk_list_box_append(list, make_row(d, linkgrabber));
         shown++;
     }
+    return shown;
+}
+
+/* Site grouping for the linkgrabber. When `nested`, packages are shown under
+ * their site header; otherwise links are listed directly under the site. */
+static int render_site_view(App *a, GtkListBox *list, int nested)
+{
+    const char *view = "linkgrabber";
+    /* unique hosts, in first-appearance order */
+    GPtrArray *hosts = g_ptr_array_new_with_free_func(g_free);
+    for (int i = 0; i < a->n; i++) {
+        Dl *d = &a->items[i];
+        if (!d->list || strcmp(d->list, view)) continue;
+        char h[256]; host_of(d->url, h, sizeof h);
+        int seen = 0;
+        for (guint k = 0; k < hosts->len; k++)
+            if (!strcmp(g_ptr_array_index(hosts, k), h)) { seen = 1; break; }
+        if (!seen) g_ptr_array_add(hosts, g_strdup(h));
+    }
+
+    int shown = 0;
+    for (guint hi = 0; hi < hosts->len; hi++) {
+        const char *host = g_ptr_array_index(hosts, hi);
+        int count = 0;
+        for (int i = 0; i < a->n; i++) {
+            Dl *d = &a->items[i];
+            if (!d->list || strcmp(d->list, view)) continue;
+            char h[256]; host_of(d->url, h, sizeof h);
+            if (!strcmp(h, host)) count++;
+        }
+        gtk_list_box_append(list, make_site_header(a, host, count));
+        shown++;
+        if (site_collapsed(a, host)) continue;
+
+        if (nested) {
+            /* packages of this host */
+            for (int pi = 0; pi < a->npkg; pi++) {
+                Pkg *p = &a->pkgs[pi];
+                if (!p->list || strcmp(p->list, view)) continue;
+                char ph[256]; pkg_host(a, p, view, ph, sizeof ph);
+                if (strcmp(ph, host)) continue;
+                gtk_list_box_append(list, make_pkg_header(a, p, 1));
+                if (p->collapsed) continue;
+                for (int i = 0; i < a->n; i++) {
+                    Dl *d = &a->items[i];
+                    if (d->package_id != p->id || !d->list || strcmp(d->list, view))
+                        continue;
+                    gtk_list_box_append(list, make_row(d, 1));
+                }
+            }
+            /* loose links of this host (no package) */
+            for (int i = 0; i < a->n; i++) {
+                Dl *d = &a->items[i];
+                if (!d->list || strcmp(d->list, view)) continue;
+                if (item_has_pkg(a, d, view)) continue;
+                char h[256]; host_of(d->url, h, sizeof h);
+                if (strcmp(h, host)) continue;
+                gtk_list_box_append(list, make_row(d, 1));
+            }
+        } else {
+            /* all links of this host, regardless of package */
+            for (int i = 0; i < a->n; i++) {
+                Dl *d = &a->items[i];
+                if (!d->list || strcmp(d->list, view)) continue;
+                char h[256]; host_of(d->url, h, sizeof h);
+                if (strcmp(h, host)) continue;
+                gtk_list_box_append(list, make_row(d, 1));
+            }
+        }
+    }
+    g_ptr_array_free(hosts, TRUE);
+    return shown;
+}
+
+static void render_into(App *a, GtkListBox *list, const char *view,
+                        const char *filter)
+{
+    GtkWidget *child;
+    while ((child = gtk_widget_get_first_child(GTK_WIDGET(list))))
+        gtk_list_box_remove(list, child);
+
+    int linkgrabber = !strcmp(view, "linkgrabber");
+    int shown;
+    if (linkgrabber && a->group_mode != GROUP_PKG)
+        shown = render_site_view(a, list, a->group_mode == GROUP_SITE_PKG);
+    else
+        shown = render_pkg_view(a, list, view, filter, linkgrabber);
 
     if (shown == 0) {
         GtkWidget *empty = adw_status_page_new();
@@ -545,6 +899,7 @@ static void free_items(App *a)
         free(a->items[i].state);
         free(a->items[i].list);
         free(a->items[i].availability);
+        free(a->items[i].url);
     }
     free(a->items);
     a->items = NULL;
@@ -610,6 +965,7 @@ static void apply_downloads(App *a, json_t *arr)
         d->force = json_is_true(json_object_get(o, "force"));
         d->list = g_strdup(json_string_value(json_object_get(o, "list")));
         d->availability = g_strdup(json_string_value(json_object_get(o, "availability")));
+        d->url = g_strdup(json_string_value(json_object_get(o, "url")));
     }
 }
 
@@ -736,6 +1092,24 @@ static void do_add(const char *url, const char *dir)
     dlm_extract_result_free(&res);
 }
 
+/* If `text` (clipboard contents) starts with a supported URL scheme, return a
+ * freshly-allocated, trimmed copy of the first whitespace-delimited token;
+ * otherwise NULL. Keeps the heavy extractor off non-link clipboard contents. */
+static char *detect_url(const char *text)
+{
+    if (!text) return NULL;
+    while (*text == ' ' || *text == '\t' || *text == '\n' || *text == '\r') text++;
+    static const char *const schemes[] = {
+        "http://", "https://", "ftp://", "ftps://", "magnet:", NULL };
+    int ok = 0;
+    for (int i = 0; schemes[i]; i++)
+        if (g_ascii_strncasecmp(text, schemes[i], strlen(schemes[i])) == 0) { ok = 1; break; }
+    if (!ok) return NULL;
+    size_t len = strcspn(text, " \t\r\n");  /* first token only */
+    if (len == 0) return NULL;
+    return g_strndup(text, len);
+}
+
 /* Resolve a URL and stage the tasks into the linkgrabber as one package. */
 static void do_grab(const char *url, const char *dir)
 {
@@ -803,6 +1177,20 @@ static void on_add_response(AdwAlertDialog *d, const char *response, gpointer us
     g_free(e);
 }
 
+/* Clipboard read finished: if the dialog's URL field is still empty and the
+ * clipboard holds a link, drop it in so the user can just hit Add. */
+static void on_add_clip_ready(GObject *src, GAsyncResult *res, gpointer user)
+{
+    GtkEditable *url = user;            /* held with a ref until this fires */
+    char *text = gdk_clipboard_read_text_finish(GDK_CLIPBOARD(src), res, NULL);
+    char *link = detect_url(text);
+    if (link && (!gtk_editable_get_text(url) || !*gtk_editable_get_text(url)))
+        gtk_editable_set_text(url, link);
+    g_free(link);
+    g_free(text);
+    g_object_unref(url);
+}
+
 static void on_add_clicked(GtkButton *b, gpointer user)
 {
     (void)b;
@@ -815,6 +1203,10 @@ static void on_add_clicked(GtkButton *b, gpointer user)
     GtkWidget *url = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(url), "https://…");
     gtk_widget_set_size_request(url, 380, -1);
+    /* auto-paste: prefill from the clipboard if it holds a link */
+    GdkClipboard *clip = gtk_widget_get_clipboard(GTK_WIDGET(a->win));
+    gdk_clipboard_read_text_async(clip, NULL, on_add_clip_ready,
+                                  g_object_ref(GTK_EDITABLE(url)));
     GtkWidget *dir = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(dir), "Download folder");
     gtk_editable_set_text(GTK_EDITABLE(dir), a->download_dir);
@@ -1010,6 +1402,15 @@ static void on_filter_changed(GtkDropDown *dd, GParamSpec *ps, gpointer user)
     rebuild_list((App *)user);
 }
 
+/* linkgrabber grouping: 0=Site+packages, 1=Site, 2=Packages (see enum). */
+static void on_group_changed(GtkDropDown *dd, GParamSpec *ps, gpointer user)
+{
+    (void)ps;
+    App *a = user;
+    a->group_mode = (int)gtk_drop_down_get_selected(dd);
+    rebuild_list(a);
+}
+
 /* ---- settings (max concurrent + global speed limit) ------------------ */
 
 typedef struct { GtkEditable *jobs, *limit; } SettingsEntries;
@@ -1126,6 +1527,48 @@ static void on_confirm_all(GtkButton *b, gpointer u)
     toast(&g_app, "Linkgrabber confirmed into the queue");
 }
 
+/* ---- clipboard monitor (JDownloader-style auto-paste) ---------------- */
+
+/* Clipboard read finished while monitoring: stage any newly-copied link. */
+static void on_monitor_clip_ready(GObject *src, GAsyncResult *res, gpointer user)
+{
+    App *a = user;
+    char *text = gdk_clipboard_read_text_finish(GDK_CLIPBOARD(src), res, NULL);
+    char *link = detect_url(text);
+    /* skip non-links and the same URL fired twice (some apps re-set on focus) */
+    if (link && g_strcmp0(link, a->clip_last) != 0) {
+        g_free(a->clip_last);
+        a->clip_last = g_strdup(link);
+        do_grab(link, a->download_dir);
+    }
+    g_free(link);
+    g_free(text);
+}
+
+static void on_clip_changed(GdkClipboard *clip, gpointer user)
+{
+    App *a = user;
+    gdk_clipboard_read_text_async(clip, NULL, on_monitor_clip_ready, a);
+}
+
+static void on_clip_toggle(GtkToggleButton *btn, gpointer user)
+{
+    App *a = user;
+    if (!a->clip) a->clip = gtk_widget_get_clipboard(GTK_WIDGET(a->win));
+    if (gtk_toggle_button_get_active(btn)) {
+        if (!a->clip_handler)
+            a->clip_handler = g_signal_connect(a->clip, "changed",
+                                               G_CALLBACK(on_clip_changed), a);
+        toast(a, "Auto-paste on: copied links go to the linkgrabber");
+    } else {
+        if (a->clip_handler) {
+            g_signal_handler_disconnect(a->clip, a->clip_handler);
+            a->clip_handler = 0;
+        }
+        toast(a, "Auto-paste off");
+    }
+}
+
 /* ---- activate / main -------------------------------------------------- */
 
 /* A boxed list box inside a scroller (one per view). */
@@ -1193,6 +1636,14 @@ static void on_activate(GtkApplication *app, gpointer user)
     g_signal_connect(filter, "notify::selected", G_CALLBACK(on_filter_changed), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), filter);
 
+    /* linkgrabber grouping mode (order must match the GROUP_* enum) */
+    const char *const groups[] = {"Site + packages", "Site", "Packages", NULL};
+    GtkWidget *group = gtk_drop_down_new_from_strings(groups);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(group), a->group_mode);
+    gtk_widget_set_tooltip_text(group, "Linkgrabber grouping");
+    g_signal_connect(group, "notify::selected", G_CALLBACK(on_group_changed), a);
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), group);
+
     GtkWidget *clear = gtk_button_new_from_icon_name("edit-clear-all-symbolic");
     gtk_widget_set_tooltip_text(clear, "Clear finished downloads");
     g_signal_connect(clear, "clicked", G_CALLBACK(on_clear_finished), a);
@@ -1202,6 +1653,14 @@ static void on_activate(GtkApplication *app, gpointer user)
     gtk_widget_set_tooltip_text(confirm, "Confirm all linkgrabber links into the queue");
     g_signal_connect(confirm, "clicked", G_CALLBACK(on_confirm_all), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), confirm);
+
+    /* auto-paste monitor: copied links are staged into the linkgrabber */
+    GtkWidget *clipmon = gtk_toggle_button_new();
+    gtk_button_set_icon_name(GTK_BUTTON(clipmon), "edit-paste-symbolic");
+    gtk_widget_set_tooltip_text(clipmon,
+        "Auto-paste: watch the clipboard and stage copied links in the linkgrabber");
+    g_signal_connect(clipmon, "toggled", G_CALLBACK(on_clip_toggle), a);
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), clipmon);
 
     GtkWidget *ia = gtk_button_new_from_icon_name("avatar-default-symbolic");
     gtk_widget_set_tooltip_text(ia, "archive.org account");
@@ -1261,6 +1720,9 @@ int main(int argc, char **argv)
     int status = g_application_run(G_APPLICATION(g_app.app), argc, argv);
     g_object_unref(g_app.app);
     g_string_free(g_app.rx, TRUE);
+    g_free(g_app.clip_last);
+    for (int i = 0; i < g_app.ncsites; i++) g_free(g_app.csites[i]);
+    g_free(g_app.csites);
     free_items(&g_app);
     free_pkgs(&g_app);
     return status;

@@ -34,8 +34,9 @@ static struct curl_slist *build_list(const char *const *headers)
     return l;
 }
 
-int dlm_http_request(const char *url, const char *post_fields,
-                     const char *const *headers, char **body, long *status)
+static int http_do(const char *url, const char *post_fields,
+                   const char *const *headers, char **body, size_t *len,
+                   long *status)
 {
     dlm_global_init();
     CURL *c = curl_easy_init();
@@ -70,11 +71,25 @@ int dlm_http_request(const char *url, const char *post_fields,
         DLM_ERROR("http %s failed: %s", url, curl_easy_strerror(rc));
         free(m.data);
         if (body) *body = NULL;
+        if (len) *len = 0;
         return DLM_ERR_NET;
     }
+    if (len) *len = m.data ? m.len : 0;
     if (body) *body = m.data ? m.data : dlm_xstrdup("");
     else free(m.data);
     return DLM_OK;
+}
+
+int dlm_http_request(const char *url, const char *post_fields,
+                     const char *const *headers, char **body, long *status)
+{
+    return http_do(url, post_fields, headers, body, NULL, status);
+}
+
+int dlm_http_get_blob(const char *url, const char *const *headers, char **body,
+                      size_t *len, long *status)
+{
+    return http_do(url, NULL, headers, body, len, status);
 }
 
 int dlm_http_get(const char *url, const char *const *headers, char **body,
