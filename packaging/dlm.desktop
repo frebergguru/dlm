@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=dlm
+GenericName=Download Manager
+Comment=Segmented download manager with archive.org and yt-dlp support
+Exec=dlm-gui
+Icon=dlm
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=download;manager;archive.org;yt-dlp;video;segmented;
+StartupNotify=true
+StartupWMClass=org.dlm.Gui

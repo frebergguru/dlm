@@ -1,0 +1,11 @@
+# Build directories
+build/
+build-asan/
+build-*/
+
+# Editor / tooling caches
+.cache/
+compile_commands.json
+
+# Stray download
+/lis

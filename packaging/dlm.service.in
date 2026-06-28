@@ -1,0 +1,13 @@
+[Unit]
+Description=dlm download daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/dlmd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

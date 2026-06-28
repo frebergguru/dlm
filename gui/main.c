@@ -1,0 +1,1267 @@
+/* dlm-gui — GTK4 + libadwaita front-end for the dlm download daemon.
+ *
+ * The GUI is a thin, reactive view over dlmd: it opens a long-lived "subscribe"
+ * connection and rebuilds the download list from each progress event, and sends
+ * one-shot commands (add/pause/resume/cancel/rm/set) over short connections.
+ * All engine/queue logic lives in the daemon; this process only renders and
+ * issues commands.
+ */
+#include "client.h"
+#include "dlm/dlm.h"
+#include "dlm/extract.h"
+#include "dlm/iaauth.h"
+
+#include <adwaita.h>
+#include <errno.h>
+#include <glib-unix.h>
+#include <jansson.h>
+#include <string.h>
+#include <unistd.h>
+
+/* ---- model ------------------------------------------------------------ */
+
+typedef struct {
+    long long id;
+    char *name;
+    char *state;
+    long long total, downloaded;
+    double speed;
+    long long package_id;
+    int priority;
+    int enabled;
+    int autostart;
+    int force;
+    char *list;            /* "download" | "linkgrabber" */
+    char *availability;    /* "online" | "offline" | "unknown" */
+} Dl;
+
+typedef struct {
+    long long id;
+    char *name;
+    char *folder;
+    char *list;
+    int priority;
+    int collapsed;
+    int links;
+} Pkg;
+
+typedef struct {
+    AdwApplication *app;
+    GtkWindow *win;
+    AdwToastOverlay *toast;
+    GtkListBox *dlist;      /* download-list view */
+    GtkListBox *glist;      /* linkgrabber view */
+    AdwViewStack *stack;
+    GtkLabel *status;       /* aggregate speed / counts */
+    GtkDropDown *filter;    /* All / Active / Queued / Done */
+    int sub_fd;
+    GString *rx;            /* partial-line buffer for the subscribe stream */
+    guint sub_source;       /* g_unix_fd_add id */
+    Dl *items;
+    int n;
+    Pkg *pkgs;
+    int npkg;
+    int max_active;
+    gint64 max_speed;
+    int autostart;          /* global Start/Stop state */
+    char *download_dir;     /* remembered destination folder */
+} App;
+
+static App g_app;
+
+/* ---- helpers ---------------------------------------------------------- */
+
+static void human(double n, char *buf, size_t len)
+{
+    static const char *u[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    int i = 0;
+    while (n >= 1024.0 && i < 4) { n /= 1024.0; i++; }
+    snprintf(buf, len, "%.1f %s", n, u[i]);
+}
+
+static void toast(App *a, const char *msg)
+{
+    adw_toast_overlay_add_toast(a->toast, adw_toast_new(msg));
+}
+
+/* open a short connection, send one command, ignore the reply */
+static void send_cmd(const char *json)
+{
+    int fd = dlm_client_connect();
+    if (fd < 0) { toast(&g_app, "Cannot reach daemon"); return; }
+    char *resp = dlm_client_rpc(fd, json);
+    free(resp);
+    close(fd);
+}
+
+/* ---- generic, parameterized row/package action ----------------------- */
+
+/* One descriptor wires a popover button (or quick button) to a daemon command,
+ * covering every CLI verb: pause/resume/rm, priority, enable/disable, autostart,
+ * force, move, confirm, lg_remove, pkg. Optional fields are sent only when set. */
+typedef struct {
+    char cmd[20];
+    long long id;
+    int is_pkg;
+    int has_level; int level;     /* priority */
+    const char *dir;              /* move: up/down/top/bottom (static) */
+    int onflag;                   /* autostart "on": -1 none else 0/1 */
+    int startflag;                /* confirm "start": -1 none else 0/1 */
+    int collapsedflag;            /* pkg "collapsed": -1 none else 0/1 */
+    GtkPopover *pop;              /* popped down after firing */
+} ActionCtx;
+
+/* Base context with all optional fields disabled (-1) — never brace-init an
+ * ActionCtx directly or zeroed onflag/startflag would send on=false. */
+static ActionCtx ctx_make(const char *cmd, long long id, int is_pkg)
+{
+    ActionCtx c;
+    memset(&c, 0, sizeof c);
+    snprintf(c.cmd, sizeof c.cmd, "%s", cmd);
+    c.id = id;
+    c.is_pkg = is_pkg;
+    c.onflag = -1;
+    c.startflag = -1;
+    c.collapsedflag = -1;
+    return c;
+}
+
+static void on_action(GtkButton *b, gpointer u)
+{
+    (void)b;
+    ActionCtx *c = u;
+    json_t *r = json_object();
+    json_object_set_new(r, "cmd", json_string(c->cmd));
+    if (c->id > 0) json_object_set_new(r, "id", json_integer(c->id));
+    if (c->is_pkg) json_object_set_new(r, "package", json_true());
+    if (c->has_level) json_object_set_new(r, "level", json_integer(c->level));
+    if (c->dir) json_object_set_new(r, "dir", json_string(c->dir));
+    if (c->onflag >= 0) json_object_set_new(r, "on", json_boolean(c->onflag));
+    if (c->startflag >= 0) json_object_set_new(r, "start", json_boolean(c->startflag));
+    if (c->collapsedflag >= 0)
+        json_object_set_new(r, "collapsed", json_boolean(c->collapsedflag));
+    char *s = json_dumps(r, JSON_COMPACT);
+    json_decref(r);
+    send_cmd(s);
+    free(s);
+    if (c->pop) gtk_popover_popdown(c->pop);
+}
+
+/* Icon button that fires an ActionCtx directly (no popover). */
+static GtkWidget *quick_btn(const char *icon, const char *tip, ActionCtx tmpl)
+{
+    GtkWidget *b = gtk_button_new_from_icon_name(icon);
+    gtk_widget_set_tooltip_text(b, tip);
+    gtk_widget_add_css_class(b, "flat");
+    gtk_widget_set_valign(b, GTK_ALIGN_CENTER);
+    ActionCtx *c = g_new0(ActionCtx, 1);
+    *c = tmpl;
+    c->pop = NULL;
+    g_object_set_data_full(G_OBJECT(b), "ctx", c, g_free);
+    g_signal_connect(b, "clicked", G_CALLBACK(on_action), c);
+    return b;
+}
+
+/* Append a labelled button to a popover's box, owning a copy of `tmpl`. */
+static void pop_add(GtkWidget *box, GtkPopover *pop, const char *label,
+                    ActionCtx tmpl)
+{
+    GtkWidget *btn = gtk_button_new_with_label(label);
+    gtk_widget_add_css_class(btn, "flat");
+    gtk_button_set_has_frame(GTK_BUTTON(btn), FALSE);
+    GtkWidget *lbl = gtk_button_get_child(GTK_BUTTON(btn));
+    if (GTK_IS_LABEL(lbl)) gtk_label_set_xalign(GTK_LABEL(lbl), 0.0);
+    ActionCtx *c = g_new0(ActionCtx, 1);
+    *c = tmpl;
+    c->pop = pop;
+    g_object_set_data_full(G_OBJECT(btn), "ctx", c, g_free);
+    g_signal_connect(btn, "clicked", G_CALLBACK(on_action), c);
+    gtk_box_append(GTK_BOX(box), btn);
+}
+
+static void pop_sep(GtkWidget *box)
+{
+    gtk_box_append(GTK_BOX(box), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+}
+
+/* Build a "⋮" menu button whose popover contains `box` (caller fills it). */
+static GtkWidget *menu_button(GtkWidget **box_out, GtkPopover **pop_out)
+{
+    GtkWidget *mb = gtk_menu_button_new();
+    gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(mb), "view-more-symbolic");
+    gtk_widget_add_css_class(mb, "flat");
+    GtkWidget *pop = gtk_popover_new();
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_margin_top(box, 6); gtk_widget_set_margin_bottom(box, 6);
+    gtk_widget_set_margin_start(box, 6); gtk_widget_set_margin_end(box, 6);
+    gtk_popover_set_child(GTK_POPOVER(pop), box);
+    gtk_menu_button_set_popover(GTK_MENU_BUTTON(mb), pop);
+    *box_out = box;
+    *pop_out = GTK_POPOVER(pop);
+    return mb;
+}
+
+/* Add the shared "Priority ▸" and "Move ▸" entries to a popover box. */
+static void pop_add_priority(GtkWidget *box, GtkPopover *pop, long long id, int is_pkg)
+{
+    static const struct { const char *label; int level; } P[] = {
+        {"Priority: Highest", 3}, {"Priority: High", 1},
+        {"Priority: Default", 0}, {"Priority: Low", -1},
+        {"Priority: Lowest", -3},
+    };
+    for (size_t i = 0; i < sizeof P / sizeof P[0]; i++) {
+        ActionCtx c = ctx_make("priority", id, is_pkg);
+        c.has_level = 1;
+        c.level = P[i].level;
+        pop_add(box, pop, P[i].label, c);
+    }
+}
+
+static void pop_add_move(GtkWidget *box, GtkPopover *pop, long long id, int is_pkg)
+{
+    static const char *D[] = {"up", "down", "top", "bottom"};
+    static const char *L[] = {"Move up", "Move down", "Move to top", "Move to bottom"};
+    for (size_t i = 0; i < 4; i++) {
+        ActionCtx c = ctx_make("move", id, is_pkg);
+        c.dir = D[i];
+        pop_add(box, pop, L[i], c);
+    }
+}
+
+/* ---- rendering -------------------------------------------------------- */
+
+static const char *current_filter(App *a)
+{
+    guint sel = gtk_drop_down_get_selected(a->filter);
+    switch (sel) {
+    case 1: return "active";
+    case 2: return "queued";
+    case 3: return "done";
+    default: return NULL; /* all */
+    }
+}
+
+static void on_pkg_edit_clicked(GtkButton *b, gpointer u); /* fwd */
+
+/* One download/linkgrabber link row, with all per-link queue actions. */
+static GtkWidget *make_row(Dl *d, int linkgrabber)
+{
+    GtkWidget *row = gtk_list_box_row_new();
+    gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_margin_top(outer, 8);
+    gtk_widget_set_margin_bottom(outer, 8);
+    gtk_widget_set_margin_start(outer, linkgrabber ? 12 : 24); /* indent under pkg */
+    gtk_widget_set_margin_end(outer, 12);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_hexpand(vbox, TRUE);
+
+    GtkWidget *name = gtk_label_new(d->name ? d->name : "");
+    gtk_label_set_xalign(GTK_LABEL(name), 0.0);
+    gtk_label_set_ellipsize(GTK_LABEL(name), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_widget_add_css_class(name, "heading");
+    gtk_box_append(GTK_BOX(vbox), name);
+
+    if (!linkgrabber) {
+        GtkWidget *bar = gtk_progress_bar_new();
+        double frac = d->total > 0 ? (double)d->downloaded / (double)d->total : 0.0;
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(bar), frac);
+        if (d->state && !strcmp(d->state, "active"))
+            gtk_widget_add_css_class(bar, "accent");
+        gtk_box_append(GTK_BOX(vbox), bar);
+    }
+
+    /* flags string: priority + disabled/manual/forced/offline */
+    char flags[96] = "";
+    const char *pt = "";
+    switch (d->priority) {
+    case 3: pt = "Highest"; break; case 2: pt = "Higher"; break;
+    case 1: pt = "High"; break; case -1: pt = "Low"; break;
+    case -2: pt = "Lower"; break; case -3: pt = "Lowest"; break;
+    }
+    if (*pt) { strncat(flags, " · prio ", sizeof flags - strlen(flags) - 1);
+               strncat(flags, pt, sizeof flags - strlen(flags) - 1); }
+    if (!d->enabled) strncat(flags, " · disabled", sizeof flags - strlen(flags) - 1);
+    if (!d->autostart) strncat(flags, " · manual", sizeof flags - strlen(flags) - 1);
+    if (d->force) strncat(flags, " · forced", sizeof flags - strlen(flags) - 1);
+
+    char db[24], tb[24], sb[24], meta[256];
+    const char *state = d->state ? d->state : "?";
+    human((double)d->downloaded, db, sizeof db);
+    human((double)d->total, tb, sizeof tb);
+    human(d->speed, sb, sizeof sb);
+    if (linkgrabber) {
+        const char *av = d->availability ? d->availability : "unknown";
+        snprintf(meta, sizeof meta, "%s · %s%s", av,
+                 d->total > 0 ? tb : "size unknown", flags);
+    } else if (d->total > 0 && d->speed > 1 && d->downloaded < d->total) {
+        long eta = (long)((double)(d->total - d->downloaded) / d->speed);
+        snprintf(meta, sizeof meta, "%s · %s / %s · %s/s · ETA %ld:%02ld%s",
+                 state, db, tb, sb, eta / 60, eta % 60, flags);
+    } else {
+        snprintf(meta, sizeof meta, "%s · %s / %s%s", state, db,
+                 d->total > 0 ? tb : "?", flags);
+    }
+    GtkWidget *ml = gtk_label_new(meta);
+    gtk_label_set_xalign(GTK_LABEL(ml), 0.0);
+    gtk_widget_add_css_class(ml, "dim-label");
+    gtk_widget_add_css_class(ml, "caption");
+    gtk_box_append(GTK_BOX(vbox), ml);
+    gtk_box_append(GTK_BOX(outer), vbox);
+
+    /* right: quick buttons + ⋮ menu + remove */
+    GtkWidget *btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_set_valign(btns, GTK_ALIGN_CENTER);
+    long long id = d->id;
+
+    GtkWidget *box, *mb;
+    GtkPopover *pop;
+
+    if (linkgrabber) {
+        ActionCtx cf = ctx_make("confirm", id, 0); cf.startflag = 1;
+        gtk_box_append(GTK_BOX(btns),
+                       quick_btn("object-select-symbolic", "Confirm (start)", cf));
+        mb = menu_button(&box, &pop);
+        ActionCtx cn = ctx_make("confirm", id, 0); cn.startflag = 0;
+        pop_add(box, pop, "Confirm (don't start)", cn);
+        pop_sep(box);
+        pop_add_move(box, pop, id, 0);
+        gtk_box_append(GTK_BOX(btns), mb);
+        ActionCtx rm = ctx_make("lg_remove", id, 0);
+        gtk_box_append(GTK_BOX(btns),
+                       quick_btn("user-trash-symbolic", "Remove from linkgrabber", rm));
+    } else {
+        if (d->state && !strcmp(d->state, "active")) {
+            gtk_box_append(GTK_BOX(btns),
+                quick_btn("media-playback-pause-symbolic", "Pause", ctx_make("pause", id, 0)));
+        } else if (d->state && (!strcmp(d->state, "paused") || !strcmp(d->state, "error"))) {
+            gtk_box_append(GTK_BOX(btns),
+                quick_btn("media-playback-start-symbolic", "Resume", ctx_make("resume", id, 0)));
+        } else if (d->state && !strcmp(d->state, "queued")) {
+            gtk_box_append(GTK_BOX(btns),
+                quick_btn("media-playback-start-symbolic", "Start now", ctx_make("force", id, 0)));
+        }
+        mb = menu_button(&box, &pop);
+        pop_add(box, pop, "Start now (force)", ctx_make("force", id, 0));
+        if (d->enabled) pop_add(box, pop, "Disable", ctx_make("disable", id, 0));
+        else pop_add(box, pop, "Enable", ctx_make("enable", id, 0));
+        { ActionCtx c = ctx_make("autostart", id, 0); c.onflag = d->autostart ? 0 : 1;
+          pop_add(box, pop, d->autostart ? "Auto-download: off" : "Auto-download: on", c); }
+        pop_sep(box);
+        pop_add_priority(box, pop, id, 0);
+        pop_sep(box);
+        pop_add_move(box, pop, id, 0);
+        gtk_box_append(GTK_BOX(btns), mb);
+        gtk_box_append(GTK_BOX(btns),
+                       quick_btn("user-trash-symbolic", "Remove", ctx_make("rm", id, 0)));
+    }
+
+    gtk_box_append(GTK_BOX(outer), btns);
+    gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), outer);
+    return row;
+}
+
+/* A package header row with collapse + package-wide actions. */
+static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber)
+{
+    (void)a;
+    GtkWidget *row = gtk_list_box_row_new();
+    gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_top(outer, 6);
+    gtk_widget_set_margin_bottom(outer, 6);
+    gtk_widget_set_margin_start(outer, 8);
+    gtk_widget_set_margin_end(outer, 12);
+    gtk_widget_add_css_class(outer, "toolbar");
+
+    /* collapse/expand toggle */
+    ActionCtx ce = ctx_make("pkg", p->id, 0);
+    ce.collapsedflag = p->collapsed ? 0 : 1;
+    gtk_box_append(GTK_BOX(outer),
+        quick_btn(p->collapsed ? "pan-end-symbolic" : "pan-down-symbolic",
+                  p->collapsed ? "Expand" : "Collapse", ce));
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_hexpand(vbox, TRUE);
+    GtkWidget *name = gtk_label_new(p->name ? p->name : "package");
+    gtk_label_set_xalign(GTK_LABEL(name), 0.0);
+    gtk_label_set_ellipsize(GTK_LABEL(name), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_widget_add_css_class(name, "heading");
+    gtk_box_append(GTK_BOX(vbox), name);
+    char sub[400];
+    snprintf(sub, sizeof sub, "%d link%s%s%s", p->links, p->links == 1 ? "" : "s",
+             p->folder ? " · " : "", p->folder ? p->folder : "");
+    GtkWidget *subl = gtk_label_new(sub);
+    gtk_label_set_xalign(GTK_LABEL(subl), 0.0);
+    gtk_label_set_ellipsize(GTK_LABEL(subl), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_widget_add_css_class(subl, "dim-label");
+    gtk_widget_add_css_class(subl, "caption");
+    gtk_box_append(GTK_BOX(vbox), subl);
+    gtk_box_append(GTK_BOX(outer), vbox);
+
+    GtkWidget *btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_set_valign(btns, GTK_ALIGN_CENTER);
+    long long id = p->id;
+
+    if (linkgrabber) {
+        ActionCtx cf = ctx_make("confirm", id, 1); cf.startflag = 1;
+        gtk_box_append(GTK_BOX(btns),
+                       quick_btn("object-select-symbolic", "Confirm package", cf));
+    }
+
+    GtkWidget *box;
+    GtkPopover *pop;
+    GtkWidget *mb = menu_button(&box, &pop);
+    if (linkgrabber) {
+        ActionCtx c1 = ctx_make("confirm", id, 1); c1.startflag = 1;
+        pop_add(box, pop, "Confirm (start)", c1);
+        ActionCtx c0 = ctx_make("confirm", id, 1); c0.startflag = 0;
+        pop_add(box, pop, "Confirm (don't start)", c0);
+        pop_sep(box);
+        pop_add_move(box, pop, id, 1);
+        pop_sep(box);
+        /* Edit (name/folder/priority) via dialog */
+        GtkWidget *edit = gtk_button_new_with_label("Edit package…");
+        gtk_widget_add_css_class(edit, "flat");
+        g_object_set_data(G_OBJECT(edit), "pid", (gpointer)(intptr_t)id);
+        g_object_set_data_full(G_OBJECT(edit), "pop", g_object_ref(pop), g_object_unref);
+        g_signal_connect(edit, "clicked", G_CALLBACK(on_pkg_edit_clicked), &g_app);
+        gtk_box_append(GTK_BOX(box), edit);
+        pop_add(box, pop, "Remove package", ctx_make("lg_remove", id, 1));
+    } else {
+        pop_add(box, pop, "Start all (force)", ctx_make("force", id, 1));
+        pop_add(box, pop, "Enable all", ctx_make("enable", id, 1));
+        pop_add(box, pop, "Disable all", ctx_make("disable", id, 1));
+        { ActionCtx con = ctx_make("autostart", id, 1); con.onflag = 1;
+          pop_add(box, pop, "Auto-download: on", con);
+          ActionCtx cof = ctx_make("autostart", id, 1); cof.onflag = 0;
+          pop_add(box, pop, "Auto-download: off", cof); }
+        pop_sep(box);
+        pop_add_priority(box, pop, id, 1);
+        pop_sep(box);
+        pop_add_move(box, pop, id, 1);
+        pop_sep(box);
+        GtkWidget *edit = gtk_button_new_with_label("Edit package…");
+        gtk_widget_add_css_class(edit, "flat");
+        g_object_set_data(G_OBJECT(edit), "pid", (gpointer)(intptr_t)id);
+        g_object_set_data_full(G_OBJECT(edit), "pop", g_object_ref(pop), g_object_unref);
+        g_signal_connect(edit, "clicked", G_CALLBACK(on_pkg_edit_clicked), &g_app);
+        gtk_box_append(GTK_BOX(box), edit);
+        pop_add(box, pop, "Remove package", ctx_make("rm", id, 1));
+    }
+    gtk_box_append(GTK_BOX(btns), mb);
+
+    gtk_box_append(GTK_BOX(outer), btns);
+    gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), outer);
+    return row;
+}
+
+static void render_into(App *a, GtkListBox *list, const char *view,
+                        const char *filter)
+{
+    GtkWidget *child;
+    while ((child = gtk_widget_get_first_child(GTK_WIDGET(list))))
+        gtk_list_box_remove(list, child);
+
+    int linkgrabber = !strcmp(view, "linkgrabber");
+    int shown = 0;
+
+    /* packaged links (packages already arrive position-sorted) */
+    for (int pi = 0; pi < a->npkg; pi++) {
+        Pkg *p = &a->pkgs[pi];
+        if (!p->list || strcmp(p->list, view)) continue;
+        gtk_list_box_append(list, make_pkg_header(a, p, linkgrabber));
+        shown++;
+        if (p->collapsed) continue;
+        for (int i = 0; i < a->n; i++) {
+            Dl *d = &a->items[i];
+            if (d->package_id != p->id || !d->list || strcmp(d->list, view)) continue;
+            if (!linkgrabber && filter && (!d->state || strcmp(d->state, filter))) continue;
+            gtk_list_box_append(list, make_row(d, linkgrabber));
+        }
+    }
+    /* loose links (no package in this view) */
+    for (int i = 0; i < a->n; i++) {
+        Dl *d = &a->items[i];
+        if (!d->list || strcmp(d->list, view)) continue;
+        int has_pkg = 0;
+        for (int pi = 0; pi < a->npkg; pi++)
+            if (a->pkgs[pi].id == d->package_id && a->pkgs[pi].list &&
+                !strcmp(a->pkgs[pi].list, view)) { has_pkg = 1; break; }
+        if (has_pkg) continue;
+        if (!linkgrabber && filter && (!d->state || strcmp(d->state, filter))) continue;
+        gtk_list_box_append(list, make_row(d, linkgrabber));
+        shown++;
+    }
+
+    if (shown == 0) {
+        GtkWidget *empty = adw_status_page_new();
+        adw_status_page_set_icon_name(ADW_STATUS_PAGE(empty),
+            linkgrabber ? "edit-find-symbolic" : "folder-download-symbolic");
+        adw_status_page_set_title(ADW_STATUS_PAGE(empty),
+            linkgrabber ? "Linkgrabber empty" : "No downloads");
+        adw_status_page_set_description(ADW_STATUS_PAGE(empty),
+            linkgrabber ? "Use + → “Review in linkgrabber” to stage links."
+                        : "Click + to add a URL or archive.org item.");
+        GtkWidget *r = gtk_list_box_row_new();
+        gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(r), FALSE);
+        gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(r), empty);
+        gtk_list_box_append(list, r);
+    }
+}
+
+static void rebuild_list(App *a)
+{
+    render_into(a, a->dlist, "download", current_filter(a));
+    render_into(a, a->glist, "linkgrabber", NULL);
+
+    double total_speed = 0;
+    int dl = 0, lg = 0;
+    for (int i = 0; i < a->n; i++) {
+        Dl *d = &a->items[i];
+        if (d->list && !strcmp(d->list, "linkgrabber")) { lg++; continue; }
+        dl++;
+        if (d->state && !strcmp(d->state, "active")) total_speed += d->speed;
+    }
+    char sb[24], line[160];
+    human(total_speed, sb, sizeof sb);
+    snprintf(line, sizeof line, "%d download%s · %s/s · %s", dl,
+             dl == 1 ? "" : "s", sb, a->autostart ? "running" : "stopped");
+    if (lg) {
+        char extra[40];
+        snprintf(extra, sizeof extra, " · %d in linkgrabber", lg);
+        strncat(line, extra, sizeof line - strlen(line) - 1);
+    }
+    gtk_label_set_text(a->status, line);
+}
+
+/* ---- snapshot parsing ------------------------------------------------- */
+
+static void free_items(App *a)
+{
+    for (int i = 0; i < a->n; i++) {
+        free(a->items[i].name);
+        free(a->items[i].state);
+        free(a->items[i].list);
+        free(a->items[i].availability);
+    }
+    free(a->items);
+    a->items = NULL;
+    a->n = 0;
+}
+
+static void free_pkgs(App *a)
+{
+    for (int i = 0; i < a->npkg; i++) {
+        free(a->pkgs[i].name);
+        free(a->pkgs[i].folder);
+        free(a->pkgs[i].list);
+    }
+    free(a->pkgs);
+    a->pkgs = NULL;
+    a->npkg = 0;
+}
+
+static void apply_packages(App *a, json_t *arr)
+{
+    free_pkgs(a);
+    if (!json_is_array(arr)) return;
+    a->npkg = (int)json_array_size(arr);
+    a->pkgs = a->npkg ? calloc((size_t)a->npkg, sizeof(Pkg)) : NULL;
+    size_t i;
+    json_t *o;
+    json_array_foreach(arr, i, o) {
+        Pkg *p = &a->pkgs[i];
+        p->id = json_integer_value(json_object_get(o, "id"));
+        p->name = g_strdup(json_string_value(json_object_get(o, "name")));
+        p->folder = g_strdup(json_string_value(json_object_get(o, "folder")));
+        p->list = g_strdup(json_string_value(json_object_get(o, "list")));
+        p->priority = json_integer_value(json_object_get(o, "priority"));
+        p->collapsed = json_is_true(json_object_get(o, "collapsed"));
+        p->links = json_integer_value(json_object_get(o, "links"));
+    }
+}
+
+static void apply_downloads(App *a, json_t *arr)
+{
+    free_items(a);
+    if (!json_is_array(arr)) return;
+    a->n = (int)json_array_size(arr);
+    a->items = a->n ? calloc((size_t)a->n, sizeof(Dl)) : NULL;
+    size_t i;
+    json_t *o;
+    json_array_foreach(arr, i, o) {
+        Dl *d = &a->items[i];
+        d->id = json_integer_value(json_object_get(o, "id"));
+        const char *nm = json_string_value(json_object_get(o, "name"));
+        const char *path = json_string_value(json_object_get(o, "out_path"));
+        const char *base = nm && *nm ? nm : (path ? path : "");
+        const char *slash = strrchr(base, '/');
+        d->name = g_strdup(slash ? slash + 1 : base);
+        d->state = g_strdup(json_string_value(json_object_get(o, "state")));
+        d->total = json_integer_value(json_object_get(o, "total"));
+        d->downloaded = json_integer_value(json_object_get(o, "downloaded"));
+        d->speed = json_real_value(json_object_get(o, "speed"));
+        d->package_id = json_integer_value(json_object_get(o, "package_id"));
+        d->priority = json_integer_value(json_object_get(o, "priority"));
+        d->enabled = json_is_true(json_object_get(o, "enabled"));
+        d->autostart = json_is_true(json_object_get(o, "autostart"));
+        d->force = json_is_true(json_object_get(o, "force"));
+        d->list = g_strdup(json_string_value(json_object_get(o, "list")));
+        d->availability = g_strdup(json_string_value(json_object_get(o, "availability")));
+    }
+}
+
+static void handle_line(App *a, const char *line)
+{
+    json_error_t e;
+    json_t *root = json_loads(line, 0, &e);
+    if (!root) return;
+    json_t *as = json_object_get(root, "autostart");
+    if (json_is_boolean(as)) a->autostart = json_is_true(as) ? 1 : 0;
+    json_t *ma = json_object_get(root, "max_active");
+    if (json_is_integer(ma)) a->max_active = (int)json_integer_value(ma);
+    json_t *ms = json_object_get(root, "max_speed");
+    if (json_is_integer(ms)) a->max_speed = json_integer_value(ms);
+    /* packages must be parsed before downloads so grouping is available */
+    apply_packages(a, json_object_get(root, "packages"));
+    json_t *dls = json_object_get(root, "downloads");
+    if (json_is_array(dls)) { apply_downloads(a, dls); rebuild_list(a); }
+    json_decref(root);
+}
+
+/* ---- subscribe stream ------------------------------------------------- */
+
+static void schedule_reconnect(App *a);
+
+static gboolean on_socket_readable(gint fd, GIOCondition cond, gpointer user)
+{
+    App *a = user;
+    if (cond & (G_IO_HUP | G_IO_ERR)) goto closed;
+
+    char buf[8192];
+    ssize_t got = read(fd, buf, sizeof buf);
+    if (got <= 0) goto closed;
+    g_string_append_len(a->rx, buf, got);
+
+    char *nl;
+    while ((nl = memchr(a->rx->str, '\n', a->rx->len))) {
+        *nl = '\0';
+        handle_line(a, a->rx->str);
+        size_t consumed = (size_t)(nl - a->rx->str) + 1;
+        g_string_erase(a->rx, 0, consumed);
+    }
+    return G_SOURCE_CONTINUE;
+
+closed:
+    a->sub_source = 0;
+    if (a->sub_fd >= 0) { close(a->sub_fd); a->sub_fd = -1; }
+    schedule_reconnect(a);
+    return G_SOURCE_REMOVE;
+}
+
+static void connect_subscribe(App *a)
+{
+    a->sub_fd = dlm_client_connect();
+    if (a->sub_fd < 0) { schedule_reconnect(a); return; }
+    const char *sub = "{\"cmd\":\"subscribe\"}\n";
+    size_t slen = strlen(sub), off = 0;
+    int werr = 0;
+    while (off < slen) { /* full-write: a short write must not desync the stream */
+        ssize_t w = write(a->sub_fd, sub + off, slen - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            werr = 1;
+            break;
+        }
+        off += (size_t)w;
+    }
+    if (werr) {
+        close(a->sub_fd);
+        a->sub_fd = -1;
+        schedule_reconnect(a);
+        return;
+    }
+    g_string_truncate(a->rx, 0);
+    a->sub_source = g_unix_fd_add(a->sub_fd, G_IO_IN | G_IO_HUP | G_IO_ERR,
+                                  on_socket_readable, a);
+}
+
+static gboolean reconnect_cb(gpointer u)
+{
+    connect_subscribe((App *)u);
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_reconnect(App *a)
+{
+    g_timeout_add_seconds(2, reconnect_cb, a);
+}
+
+/* ---- add dialog ------------------------------------------------------- */
+
+/* Resolve a URL into tasks and enqueue each into `dir` on the daemon. Runs in
+ * the click handler (a brief synchronous yt-dlp/IA resolve). */
+static void do_add(const char *url, const char *dir)
+{
+    if (!url || !*url) return;
+    if (!dir || !*dir) dir = ".";
+
+    dlm_extract_result res;
+    if (dlm_extract(url, &res) != DLM_OK || res.count == 0) {
+        toast(&g_app, "Could not resolve URL");
+        return;
+    }
+    g_mkdir_with_parents(dir, 0755);
+    int added = 0;
+    for (int i = 0; i < res.count; i++) {
+        char path[4096];
+        snprintf(path, sizeof path, "%s/%s", dir, res.tasks[i].filename);
+        json_t *r = json_object();
+        json_object_set_new(r, "cmd", json_string("add"));
+        json_object_set_new(r, "url", json_string(res.tasks[i].url));
+        json_object_set_new(r, "out", json_string(path));
+        if (res.tasks[i].delegate) json_object_set_new(r, "delegate", json_true());
+        char *s = json_dumps(r, JSON_COMPACT);
+        json_decref(r);
+        send_cmd(s);
+        free(s);
+        added++;
+    }
+    char msg[96];
+    snprintf(msg, sizeof msg, "Added %d %s (%s) to %s", added,
+             added == 1 ? "download" : "files", res.source, dir);
+    toast(&g_app, msg);
+    dlm_extract_result_free(&res);
+}
+
+/* Resolve a URL and stage the tasks into the linkgrabber as one package. */
+static void do_grab(const char *url, const char *dir)
+{
+    if (!url || !*url) return;
+    if (!dir || !*dir) dir = ".";
+    dlm_extract_result res;
+    if (dlm_extract(url, &res) != DLM_OK || res.count == 0) {
+        toast(&g_app, "Could not resolve URL");
+        return;
+    }
+    /* package name: URL basename, else extractor source */
+    char pkgname[256];
+    const char *b = strrchr(url, '/');
+    b = b ? b + 1 : url;
+    size_t bl = strcspn(b, "?#");
+    if (bl == 0 || bl >= sizeof pkgname) snprintf(pkgname, sizeof pkgname, "%s", res.source);
+    else { memcpy(pkgname, b, bl); pkgname[bl] = '\0'; }
+
+    json_t *r = json_object();
+    json_object_set_new(r, "cmd", json_string("grab"));
+    json_object_set_new(r, "name", json_string(pkgname));
+    json_object_set_new(r, "folder", json_string(dir));
+    json_t *links = json_array();
+    for (int i = 0; i < res.count; i++) {
+        dlm_task *t = &res.tasks[i];
+        char path[4096];
+        snprintf(path, sizeof path, "%s/%s", dir, t->filename);
+        json_t *l = json_object();
+        json_object_set_new(l, "url", json_string(t->url));
+        json_object_set_new(l, "out", json_string(path));
+        json_object_set_new(l, "name", json_string(t->filename));
+        json_object_set_new(l, "size", json_integer(t->size));
+        if (t->delegate) json_object_set_new(l, "delegate", json_true());
+        json_object_set_new(l, "availability",
+                            json_string(t->size >= 0 ? "online" : "unknown"));
+        json_array_append_new(links, l);
+    }
+    json_object_set_new(r, "links", links);
+    char *s = json_dumps(r, JSON_COMPACT);
+    json_decref(r);
+    send_cmd(s);
+    free(s);
+    char msg[128];
+    snprintf(msg, sizeof msg, "Staged %d %s (%s) in the linkgrabber", res.count,
+             res.count == 1 ? "link" : "links", res.source);
+    toast(&g_app, msg);
+    dlm_extract_result_free(&res);
+}
+
+typedef struct { GtkEditable *url, *dir; GtkSwitch *grab; } AddEntries;
+
+static void on_add_response(AdwAlertDialog *d, const char *response, gpointer user)
+{
+    (void)d;
+    AddEntries *e = user;
+    if (!g_strcmp0(response, "add")) {
+        const char *dir = gtk_editable_get_text(e->dir);
+        /* remember the chosen folder for next time */
+        if (dir && *dir) { g_free(g_app.download_dir); g_app.download_dir = g_strdup(dir); }
+        if (gtk_switch_get_active(e->grab))
+            do_grab(gtk_editable_get_text(e->url), g_app.download_dir);
+        else
+            do_add(gtk_editable_get_text(e->url), g_app.download_dir);
+    }
+    g_free(e);
+}
+
+static void on_add_clicked(GtkButton *b, gpointer user)
+{
+    (void)b;
+    App *a = user;
+    AdwDialog *d = adw_alert_dialog_new("Add download", NULL);
+    adw_alert_dialog_set_body(ADW_ALERT_DIALOG(d),
+        "Paste a direct URL, a yt-dlp-supported page/series, or an archive.org item.");
+
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *url = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(url), "https://…");
+    gtk_widget_set_size_request(url, 380, -1);
+    GtkWidget *dir = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(dir), "Download folder");
+    gtk_editable_set_text(GTK_EDITABLE(dir), a->download_dir);
+    gtk_box_append(GTK_BOX(box), url);
+    gtk_box_append(GTK_BOX(box), dir);
+
+    /* review-in-linkgrabber toggle (JDownloader-style staging) */
+    GtkWidget *grow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_top(grow, 4);
+    GtkWidget *glabel = gtk_label_new("Review in linkgrabber first");
+    gtk_widget_set_hexpand(glabel, TRUE);
+    gtk_label_set_xalign(GTK_LABEL(glabel), 0.0);
+    GtkWidget *gsw = gtk_switch_new();
+    gtk_widget_set_valign(gsw, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(grow), glabel);
+    gtk_box_append(GTK_BOX(grow), gsw);
+    gtk_box_append(GTK_BOX(box), grow);
+    adw_alert_dialog_set_extra_child(ADW_ALERT_DIALOG(d), box);
+
+    adw_alert_dialog_add_responses(ADW_ALERT_DIALOG(d),
+        "cancel", "Cancel", "add", "Add", NULL);
+    adw_alert_dialog_set_response_appearance(ADW_ALERT_DIALOG(d), "add",
+        ADW_RESPONSE_SUGGESTED);
+    adw_alert_dialog_set_default_response(ADW_ALERT_DIALOG(d), "add");
+
+    AddEntries *e = g_new0(AddEntries, 1);
+    e->url = GTK_EDITABLE(url);
+    e->dir = GTK_EDITABLE(dir);
+    e->grab = GTK_SWITCH(gsw);
+    g_signal_connect(d, "response", G_CALLBACK(on_add_response), e);
+    adw_dialog_present(d, GTK_WIDGET(a->win));
+}
+
+/* ---- package edit dialog --------------------------------------------- */
+
+typedef struct { long long id; GtkEditable *name, *folder; } PkgEntries;
+
+static void on_pkg_edit_response(AdwAlertDialog *d, const char *response, gpointer user)
+{
+    (void)d;
+    PkgEntries *e = user;
+    if (!g_strcmp0(response, "save")) {
+        json_t *r = json_object();
+        json_object_set_new(r, "cmd", json_string("pkg"));
+        json_object_set_new(r, "id", json_integer(e->id));
+        const char *nm = gtk_editable_get_text(e->name);
+        const char *fo = gtk_editable_get_text(e->folder);
+        if (nm && *nm) json_object_set_new(r, "name", json_string(nm));
+        if (fo && *fo) json_object_set_new(r, "folder", json_string(fo));
+        char *s = json_dumps(r, JSON_COMPACT);
+        json_decref(r);
+        send_cmd(s);
+        free(s);
+        toast(&g_app, "Package updated");
+    }
+    g_free(e);
+}
+
+static void on_pkg_edit_clicked(GtkButton *b, gpointer user)
+{
+    App *a = user;
+    long long id = (long long)(intptr_t)g_object_get_data(G_OBJECT(b), "pid");
+    GtkPopover *pop = g_object_get_data(G_OBJECT(b), "pop");
+    if (pop) gtk_popover_popdown(pop);
+
+    /* current values from the model */
+    const char *cur_name = "", *cur_folder = "";
+    for (int i = 0; i < a->npkg; i++)
+        if (a->pkgs[i].id == id) {
+            cur_name = a->pkgs[i].name ? a->pkgs[i].name : "";
+            cur_folder = a->pkgs[i].folder ? a->pkgs[i].folder : "";
+        }
+
+    AdwDialog *d = adw_alert_dialog_new("Edit package", NULL);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *name = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(name), "Package name");
+    gtk_editable_set_text(GTK_EDITABLE(name), cur_name);
+    GtkWidget *folder = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(folder), "Download folder");
+    gtk_editable_set_text(GTK_EDITABLE(folder), cur_folder);
+    gtk_box_append(GTK_BOX(box), name);
+    gtk_box_append(GTK_BOX(box), folder);
+    adw_alert_dialog_set_extra_child(ADW_ALERT_DIALOG(d), box);
+    adw_alert_dialog_add_responses(ADW_ALERT_DIALOG(d),
+        "cancel", "Cancel", "save", "Save", NULL);
+    adw_alert_dialog_set_response_appearance(ADW_ALERT_DIALOG(d), "save",
+        ADW_RESPONSE_SUGGESTED);
+
+    PkgEntries *e = g_new0(PkgEntries, 1);
+    e->id = id;
+    e->name = GTK_EDITABLE(name);
+    e->folder = GTK_EDITABLE(folder);
+    g_signal_connect(d, "response", G_CALLBACK(on_pkg_edit_response), e);
+    adw_dialog_present(d, GTK_WIDGET(a->win));
+}
+
+/* ---- archive.org account dialog -------------------------------------- */
+
+/* Mirrors the CLI's ia-login: S3 keys, a pasted cookie, or email+password. */
+typedef struct {
+    GtkEditable *access, *secret, *cookie, *email, *password;
+} IaEntries;
+
+static void on_ia_response(AdwAlertDialog *d, const char *response, gpointer user)
+{
+    (void)d;
+    IaEntries *e = user;
+    if (!g_strcmp0(response, "save")) {
+        const char *ak = gtk_editable_get_text(e->access);
+        const char *sk = gtk_editable_get_text(e->secret);
+        const char *ck = gtk_editable_get_text(e->cookie);
+        const char *em = gtk_editable_get_text(e->email);
+        const char *pw = gtk_editable_get_text(e->password);
+        if (*ak && *sk) {
+            dlm_ia_save_s3(ak, sk);
+            toast(&g_app, "archive.org: signed in (S3 keys)");
+        } else if (*em && *pw) {
+            char *err = NULL;
+            if (dlm_ia_login_password(em, pw, &err) == 0)
+                toast(&g_app, "archive.org: signed in");
+            else { toast(&g_app, err ? err : "login failed"); g_free(err); }
+        } else if (*ck) {
+            dlm_ia_save_cookie(ck);
+            toast(&g_app, "archive.org: signed in (cookie)");
+        } else {
+            toast(&g_app, "Enter S3 keys, a cookie, or email + password");
+        }
+    } else if (!g_strcmp0(response, "logout")) {
+        dlm_ia_logout();
+        toast(&g_app, "archive.org: signed out");
+    }
+    g_free(e);
+}
+
+static GtkWidget *labeled(GtkWidget *box, const char *label)
+{
+    GtkWidget *l = gtk_label_new(label);
+    gtk_label_set_xalign(GTK_LABEL(l), 0.0);
+    gtk_widget_add_css_class(l, "dim-label");
+    gtk_widget_add_css_class(l, "caption");
+    gtk_box_append(GTK_BOX(box), l);
+    GtkWidget *e = gtk_entry_new();
+    gtk_box_append(GTK_BOX(box), e);
+    return e;
+}
+
+static void on_ia_clicked(GtkButton *b, gpointer user)
+{
+    (void)b;
+    App *a = user;
+    ia_credentials c;
+    dlm_ia_load(&c);
+
+    AdwDialog *d = adw_alert_dialog_new("Internet Archive account", NULL);
+    char body[128];
+    snprintf(body, sizeof body,
+             "Current: %s.\nSign in with S3 keys (recommended), a cookie, or "
+             "email + password.", dlm_ia_mode_str(c.mode));
+    adw_alert_dialog_set_body(ADW_ALERT_DIALOG(d), body);
+
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    GtkWidget *access = labeled(box, "S3 access key");
+    GtkWidget *secret = labeled(box, "S3 secret key");
+    gtk_entry_set_visibility(GTK_ENTRY(secret), FALSE);
+    GtkWidget *cookie = labeled(box, "or session cookie");
+    GtkWidget *email = labeled(box, "or email");
+    GtkWidget *password = labeled(box, "and password");
+    gtk_entry_set_visibility(GTK_ENTRY(password), FALSE);
+    if (c.mode == IA_AUTH_S3 && c.access)
+        gtk_editable_set_text(GTK_EDITABLE(access), c.access);
+    adw_alert_dialog_set_extra_child(ADW_ALERT_DIALOG(d), box);
+
+    adw_alert_dialog_add_responses(ADW_ALERT_DIALOG(d),
+        "cancel", "Cancel", "logout", "Sign out", "save", "Sign in", NULL);
+    adw_alert_dialog_set_response_appearance(ADW_ALERT_DIALOG(d), "save",
+        ADW_RESPONSE_SUGGESTED);
+
+    IaEntries *e = g_new0(IaEntries, 1);
+    e->access = GTK_EDITABLE(access);
+    e->secret = GTK_EDITABLE(secret);
+    e->cookie = GTK_EDITABLE(cookie);
+    e->email = GTK_EDITABLE(email);
+    e->password = GTK_EDITABLE(password);
+    g_signal_connect(d, "response", G_CALLBACK(on_ia_response), e);
+    adw_dialog_present(d, GTK_WIDGET(a->win));
+    dlm_ia_credentials_free(&c);
+}
+
+static void on_filter_changed(GtkDropDown *dd, GParamSpec *ps, gpointer user)
+{
+    (void)dd; (void)ps;
+    rebuild_list((App *)user);
+}
+
+/* ---- settings (max concurrent + global speed limit) ------------------ */
+
+typedef struct { GtkEditable *jobs, *limit; } SettingsEntries;
+
+static void on_settings_response(AdwAlertDialog *d, const char *response, gpointer user)
+{
+    (void)d;
+    SettingsEntries *e = user;
+    if (!g_strcmp0(response, "save")) {
+        const char *jt = gtk_editable_get_text(e->jobs);
+        const char *lt = gtk_editable_get_text(e->limit);
+        json_t *r = json_object();
+        json_object_set_new(r, "cmd", json_string("set"));
+        if (jt && *jt) json_object_set_new(r, "max_active", json_integer(atoi(jt)));
+        /* empty / "off" / "0" clears the cap */
+        int64_t bps = (lt && *lt && g_strcmp0(lt, "off")) ? dlm_parse_rate(lt) : 0;
+        json_object_set_new(r, "max_speed", json_integer(bps));
+        char *s = json_dumps(r, JSON_COMPACT);
+        json_decref(r);
+        send_cmd(s);
+        free(s);
+        char msg[64], rb[32];
+        dlm_format_rate(bps, rb, sizeof rb);
+        snprintf(msg, sizeof msg, "Speed limit: %s", rb);
+        toast(&g_app, msg);
+    }
+    g_free(e);
+}
+
+/* Query the daemon's current max_active / max_speed (0 if unavailable). */
+static void query_settings(int *max_active, gint64 *max_speed)
+{
+    *max_active = 0;
+    *max_speed = 0;
+    int fd = dlm_client_connect();
+    if (fd < 0) return;
+    char *resp = dlm_client_rpc(fd, "{\"cmd\":\"list\"}");
+    close(fd);
+    if (!resp) return;
+    json_error_t e;
+    json_t *root = json_loads(resp, 0, &e);
+    free(resp);
+    if (!root) return;
+    *max_active = (int)json_integer_value(json_object_get(root, "max_active"));
+    *max_speed = json_integer_value(json_object_get(root, "max_speed"));
+    json_decref(root);
+}
+
+static void on_settings_clicked(GtkButton *b, gpointer user)
+{
+    (void)b;
+    App *a = user;
+    AdwDialog *d = adw_alert_dialog_new("Settings", NULL);
+
+    int cur_jobs = 0;
+    gint64 cur_speed = 0;
+    query_settings(&cur_jobs, &cur_speed);
+
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *jobs = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(jobs), "Max concurrent downloads (e.g. 3)");
+    GtkWidget *limit = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(limit), "Speed limit (e.g. 2M, 500k, off)");
+    /* prefill with the daemon's current settings */
+    if (cur_jobs > 0) {
+        char jb[16];
+        snprintf(jb, sizeof jb, "%d", cur_jobs);
+        gtk_editable_set_text(GTK_EDITABLE(jobs), jb);
+    }
+    if (cur_speed > 0) {
+        char lb[24];
+        snprintf(lb, sizeof lb, "%lld", (long long)cur_speed);
+        gtk_editable_set_text(GTK_EDITABLE(limit), lb);
+    }
+    gtk_box_append(GTK_BOX(box), jobs);
+    gtk_box_append(GTK_BOX(box), limit);
+    adw_alert_dialog_set_extra_child(ADW_ALERT_DIALOG(d), box);
+
+    adw_alert_dialog_add_responses(ADW_ALERT_DIALOG(d),
+        "cancel", "Cancel", "save", "Apply", NULL);
+    adw_alert_dialog_set_response_appearance(ADW_ALERT_DIALOG(d), "save",
+        ADW_RESPONSE_SUGGESTED);
+
+    SettingsEntries *e = g_new0(SettingsEntries, 1);
+    e->jobs = GTK_EDITABLE(jobs);
+    e->limit = GTK_EDITABLE(limit);
+    g_signal_connect(d, "response", G_CALLBACK(on_settings_response), e);
+    adw_dialog_present(d, GTK_WIDGET(a->win));
+}
+
+/* ---- global queue controls ------------------------------------------- */
+
+static void on_global_start(GtkButton *b, gpointer u)
+{
+    (void)b; (void)u;
+    send_cmd("{\"cmd\":\"set\",\"autostart\":true}");
+    toast(&g_app, "Downloads running");
+}
+static void on_global_stop(GtkButton *b, gpointer u)
+{
+    (void)b; (void)u;
+    send_cmd("{\"cmd\":\"set\",\"autostart\":false}");
+    toast(&g_app, "Stopping after current downloads");
+}
+static void on_clear_finished(GtkButton *b, gpointer u)
+{
+    (void)b; (void)u;
+    send_cmd("{\"cmd\":\"clear_finished\"}");
+}
+static void on_confirm_all(GtkButton *b, gpointer u)
+{
+    (void)b; (void)u;
+    send_cmd("{\"cmd\":\"confirm\",\"start\":true}");
+    toast(&g_app, "Linkgrabber confirmed into the queue");
+}
+
+/* ---- activate / main -------------------------------------------------- */
+
+/* A boxed list box inside a scroller (one per view). */
+static GtkWidget *make_scrolled_list(GtkListBox **out)
+{
+    GtkWidget *list = gtk_list_box_new();
+    *out = GTK_LIST_BOX(list);
+    gtk_list_box_set_selection_mode(*out, GTK_SELECTION_NONE);
+    gtk_widget_add_css_class(list, "boxed-list");
+    gtk_widget_set_valign(list, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(list, 12);
+    gtk_widget_set_margin_bottom(list, 12);
+    gtk_widget_set_margin_start(list, 12);
+    gtk_widget_set_margin_end(list, 12);
+    GtkWidget *scroll = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), list);
+    gtk_widget_set_vexpand(scroll, TRUE);
+    return scroll;
+}
+
+static void on_activate(GtkApplication *app, gpointer user)
+{
+    App *a = user;
+
+    GtkWidget *win = adw_application_window_new(app);
+    a->win = GTK_WINDOW(win);
+    gtk_window_set_title(a->win, "dlm");
+    gtk_window_set_default_size(a->win, 760, 600);
+
+    GtkWidget *header = adw_header_bar_new();
+
+    GtkWidget *add = gtk_button_new_from_icon_name("list-add-symbolic");
+    gtk_widget_set_tooltip_text(add, "Add download (or stage in linkgrabber)");
+    gtk_widget_add_css_class(add, "suggested-action");
+    g_signal_connect(add, "clicked", G_CALLBACK(on_add_clicked), a);
+    adw_header_bar_pack_start(ADW_HEADER_BAR(header), add);
+
+    /* Start / Stop the queue (global autostart) + clear finished */
+    GtkWidget *start = gtk_button_new_from_icon_name("media-playback-start-symbolic");
+    gtk_widget_set_tooltip_text(start, "Start downloads");
+    g_signal_connect(start, "clicked", G_CALLBACK(on_global_start), a);
+    adw_header_bar_pack_start(ADW_HEADER_BAR(header), start);
+    GtkWidget *stop = gtk_button_new_from_icon_name("media-playback-stop-symbolic");
+    gtk_widget_set_tooltip_text(stop, "Stop after current downloads");
+    g_signal_connect(stop, "clicked", G_CALLBACK(on_global_stop), a);
+    adw_header_bar_pack_start(ADW_HEADER_BAR(header), stop);
+
+    /* centre: switch between the download list and the linkgrabber */
+    GtkWidget *stack = adw_view_stack_new();
+    a->stack = ADW_VIEW_STACK(stack);
+    GtkWidget *dl_view = make_scrolled_list(&a->dlist);
+    GtkWidget *lg_view = make_scrolled_list(&a->glist);
+    adw_view_stack_add_titled_with_icon(a->stack, dl_view, "downloads",
+                                        "Downloads", "folder-download-symbolic");
+    adw_view_stack_add_titled_with_icon(a->stack, lg_view, "linkgrabber",
+                                        "Linkgrabber", "edit-find-symbolic");
+    GtkWidget *switcher = adw_view_switcher_new();
+    adw_view_switcher_set_stack(ADW_VIEW_SWITCHER(switcher), a->stack);
+    adw_view_switcher_set_policy(ADW_VIEW_SWITCHER(switcher), ADW_VIEW_SWITCHER_POLICY_WIDE);
+    adw_header_bar_set_title_widget(ADW_HEADER_BAR(header), switcher);
+
+    const char *const filters[] = {"All", "Active", "Queued", "Done", NULL};
+    GtkWidget *filter = gtk_drop_down_new_from_strings(filters);
+    a->filter = GTK_DROP_DOWN(filter);
+    g_signal_connect(filter, "notify::selected", G_CALLBACK(on_filter_changed), a);
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), filter);
+
+    GtkWidget *clear = gtk_button_new_from_icon_name("edit-clear-all-symbolic");
+    gtk_widget_set_tooltip_text(clear, "Clear finished downloads");
+    g_signal_connect(clear, "clicked", G_CALLBACK(on_clear_finished), a);
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), clear);
+
+    GtkWidget *confirm = gtk_button_new_from_icon_name("object-select-symbolic");
+    gtk_widget_set_tooltip_text(confirm, "Confirm all linkgrabber links into the queue");
+    g_signal_connect(confirm, "clicked", G_CALLBACK(on_confirm_all), a);
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), confirm);
+
+    GtkWidget *ia = gtk_button_new_from_icon_name("avatar-default-symbolic");
+    gtk_widget_set_tooltip_text(ia, "archive.org account");
+    g_signal_connect(ia, "clicked", G_CALLBACK(on_ia_clicked), a);
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), ia);
+
+    GtkWidget *settings = gtk_button_new_from_icon_name("emblem-system-symbolic");
+    gtk_widget_set_tooltip_text(settings, "Settings (concurrency, speed limit)");
+    g_signal_connect(settings, "clicked", G_CALLBACK(on_settings_clicked), a);
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), settings);
+
+    GtkWidget *toast_overlay = adw_toast_overlay_new();
+    a->toast = ADW_TOAST_OVERLAY(toast_overlay);
+    adw_toast_overlay_set_child(a->toast, stack);
+
+    /* status bar */
+    GtkWidget *statusbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_top(statusbar, 4);
+    gtk_widget_set_margin_bottom(statusbar, 4);
+    gtk_widget_set_margin_start(statusbar, 12);
+    gtk_widget_set_margin_end(statusbar, 12);
+    GtkWidget *status = gtk_label_new("Connecting…");
+    a->status = GTK_LABEL(status);
+    gtk_widget_add_css_class(status, "dim-label");
+    gtk_box_append(GTK_BOX(statusbar), status);
+
+    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_append(GTK_BOX(content), toast_overlay);
+    gtk_box_append(GTK_BOX(content), statusbar);
+
+    GtkWidget *tv = adw_toolbar_view_new();
+    adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(tv), header);
+    adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(tv), content);
+    adw_application_window_set_content(ADW_APPLICATION_WINDOW(win), tv);
+
+    gtk_window_present(a->win);
+    connect_subscribe(a);
+}
+
+int main(int argc, char **argv)
+{
+    memset(&g_app, 0, sizeof g_app);
+    g_app.sub_fd = -1;
+    g_app.rx = g_string_new(NULL);
+
+    /* default download folder: $DLM_DOWNLOAD_DIR, else XDG Downloads, else ~ */
+    const char *envd = g_getenv("DLM_DOWNLOAD_DIR");
+    if (envd && *envd)
+        g_app.download_dir = g_strdup(envd);
+    else {
+        const char *xdg = g_get_user_special_dir(G_USER_DIRECTORY_DOWNLOAD);
+        g_app.download_dir = g_strdup(xdg ? xdg : g_get_home_dir());
+    }
+
+    g_app.app = adw_application_new("org.dlm.Gui", G_APPLICATION_DEFAULT_FLAGS);
+    g_signal_connect(g_app.app, "activate", G_CALLBACK(on_activate), &g_app);
+    int status = g_application_run(G_APPLICATION(g_app.app), argc, argv);
+    g_object_unref(g_app.app);
+    g_string_free(g_app.rx, TRUE);
+    free_items(&g_app);
+    free_pkgs(&g_app);
+    return status;
+}
