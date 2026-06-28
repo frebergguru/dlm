@@ -444,7 +444,8 @@ static void on_site_confirm(GtkButton *b, gpointer user)
 }
 
 /* A site group header: favicon, friendly name, link count, collapse + confirm. */
-static GtkWidget *make_site_header(App *a, const char *host, int count)
+static GtkWidget *make_site_header(App *a, const char *host, int count,
+                                   int linkgrabber)
 {
     GtkWidget *row = gtk_list_box_row_new();
     gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
@@ -484,13 +485,15 @@ static GtkWidget *make_site_header(App *a, const char *host, int count)
     gtk_box_append(GTK_BOX(vbox), subl);
     gtk_box_append(GTK_BOX(outer), vbox);
 
-    GtkWidget *confirm = gtk_button_new_from_icon_name("object-select-symbolic");
-    gtk_widget_add_css_class(confirm, "flat");
-    gtk_widget_set_valign(confirm, GTK_ALIGN_CENTER);
-    gtk_widget_set_tooltip_text(confirm, "Confirm all links from this site");
-    g_object_set_data_full(G_OBJECT(confirm), "host", g_strdup(host), g_free);
-    g_signal_connect(confirm, "clicked", G_CALLBACK(on_site_confirm), a);
-    gtk_box_append(GTK_BOX(outer), confirm);
+    if (linkgrabber) {
+        GtkWidget *confirm = gtk_button_new_from_icon_name("object-select-symbolic");
+        gtk_widget_add_css_class(confirm, "flat");
+        gtk_widget_set_valign(confirm, GTK_ALIGN_CENTER);
+        gtk_widget_set_tooltip_text(confirm, "Confirm all links from this site");
+        g_object_set_data_full(G_OBJECT(confirm), "host", g_strdup(host), g_free);
+        g_signal_connect(confirm, "clicked", G_CALLBACK(on_site_confirm), a);
+        gtk_box_append(GTK_BOX(outer), confirm);
+    }
 
     gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), outer);
     return row;
@@ -764,16 +767,24 @@ static int render_pkg_view(App *a, GtkListBox *list, const char *view,
     return shown;
 }
 
-/* Site grouping for the linkgrabber. When `nested`, packages are shown under
- * their site header; otherwise links are listed directly under the site. */
-static int render_site_view(App *a, GtkListBox *list, int nested)
+/* True if `d` passes the active state filter (downloads view only). */
+static int item_passes(Dl *d, const char *filter, int linkgrabber)
 {
-    const char *view = "linkgrabber";
-    /* unique hosts, in first-appearance order */
+    if (linkgrabber || !filter) return 1;
+    return d->state && !strcmp(d->state, filter);
+}
+
+/* Site grouping for either view. When `nested`, packages are shown under their
+ * site header; otherwise links are listed directly under the site. */
+static int render_site_view(App *a, GtkListBox *list, const char *view,
+                            const char *filter, int linkgrabber, int nested)
+{
+    /* unique hosts, in first-appearance order (only over visible links) */
     GPtrArray *hosts = g_ptr_array_new_with_free_func(g_free);
     for (int i = 0; i < a->n; i++) {
         Dl *d = &a->items[i];
         if (!d->list || strcmp(d->list, view)) continue;
+        if (!item_passes(d, filter, linkgrabber)) continue;
         char h[256]; host_of(d->url, h, sizeof h);
         int seen = 0;
         for (guint k = 0; k < hosts->len; k++)
@@ -788,10 +799,11 @@ static int render_site_view(App *a, GtkListBox *list, int nested)
         for (int i = 0; i < a->n; i++) {
             Dl *d = &a->items[i];
             if (!d->list || strcmp(d->list, view)) continue;
+            if (!item_passes(d, filter, linkgrabber)) continue;
             char h[256]; host_of(d->url, h, sizeof h);
             if (!strcmp(h, host)) count++;
         }
-        gtk_list_box_append(list, make_site_header(a, host, count));
+        gtk_list_box_append(list, make_site_header(a, host, count, linkgrabber));
         shown++;
         if (site_collapsed(a, host)) continue;
 
@@ -802,13 +814,14 @@ static int render_site_view(App *a, GtkListBox *list, int nested)
                 if (!p->list || strcmp(p->list, view)) continue;
                 char ph[256]; pkg_host(a, p, view, ph, sizeof ph);
                 if (strcmp(ph, host)) continue;
-                gtk_list_box_append(list, make_pkg_header(a, p, 1));
+                gtk_list_box_append(list, make_pkg_header(a, p, linkgrabber));
                 if (p->collapsed) continue;
                 for (int i = 0; i < a->n; i++) {
                     Dl *d = &a->items[i];
                     if (d->package_id != p->id || !d->list || strcmp(d->list, view))
                         continue;
-                    gtk_list_box_append(list, make_row(d, 1));
+                    if (!item_passes(d, filter, linkgrabber)) continue;
+                    gtk_list_box_append(list, make_row(d, linkgrabber));
                 }
             }
             /* loose links of this host (no package) */
@@ -816,18 +829,20 @@ static int render_site_view(App *a, GtkListBox *list, int nested)
                 Dl *d = &a->items[i];
                 if (!d->list || strcmp(d->list, view)) continue;
                 if (item_has_pkg(a, d, view)) continue;
+                if (!item_passes(d, filter, linkgrabber)) continue;
                 char h[256]; host_of(d->url, h, sizeof h);
                 if (strcmp(h, host)) continue;
-                gtk_list_box_append(list, make_row(d, 1));
+                gtk_list_box_append(list, make_row(d, linkgrabber));
             }
         } else {
             /* all links of this host, regardless of package */
             for (int i = 0; i < a->n; i++) {
                 Dl *d = &a->items[i];
                 if (!d->list || strcmp(d->list, view)) continue;
+                if (!item_passes(d, filter, linkgrabber)) continue;
                 char h[256]; host_of(d->url, h, sizeof h);
                 if (strcmp(h, host)) continue;
-                gtk_list_box_append(list, make_row(d, 1));
+                gtk_list_box_append(list, make_row(d, linkgrabber));
             }
         }
     }
@@ -844,8 +859,9 @@ static void render_into(App *a, GtkListBox *list, const char *view,
 
     int linkgrabber = !strcmp(view, "linkgrabber");
     int shown;
-    if (linkgrabber && a->group_mode != GROUP_PKG)
-        shown = render_site_view(a, list, a->group_mode == GROUP_SITE_PKG);
+    if (a->group_mode != GROUP_PKG)
+        shown = render_site_view(a, list, view, filter, linkgrabber,
+                                 a->group_mode == GROUP_SITE_PKG);
     else
         shown = render_pkg_view(a, list, view, filter, linkgrabber);
 
@@ -1636,11 +1652,11 @@ static void on_activate(GtkApplication *app, gpointer user)
     g_signal_connect(filter, "notify::selected", G_CALLBACK(on_filter_changed), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), filter);
 
-    /* linkgrabber grouping mode (order must match the GROUP_* enum) */
+    /* grouping mode (order must match the GROUP_* enum) */
     const char *const groups[] = {"Site + packages", "Site", "Packages", NULL};
     GtkWidget *group = gtk_drop_down_new_from_strings(groups);
     gtk_drop_down_set_selected(GTK_DROP_DOWN(group), a->group_mode);
-    gtk_widget_set_tooltip_text(group, "Linkgrabber grouping");
+    gtk_widget_set_tooltip_text(group, "Group downloads & linkgrabber by site or package");
     g_signal_connect(group, "notify::selected", G_CALLBACK(on_group_changed), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), group);
 
