@@ -722,7 +722,11 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber)
         /* Edit (name/folder/priority) via dialog */
         GtkWidget *edit = gtk_button_new_with_label("Edit package…");
         gtk_widget_add_css_class(edit, "flat");
-        g_object_set_data(G_OBJECT(edit), "pid", (gpointer)(intptr_t)id);
+        /* Heap-allocate the id so the full 64 bits survive; packing it into a
+         * gpointer would truncate on 32-bit targets where pointers are 4 bytes. */
+        gint64 *pidp = g_new(gint64, 1);
+        *pidp = id;
+        g_object_set_data_full(G_OBJECT(edit), "pid", pidp, g_free);
         g_signal_connect(edit, "clicked", G_CALLBACK(on_pkg_edit_clicked), &g_app);
         gtk_box_append(GTK_BOX(box), edit);
         pop_add(box, pop, "Remove package", ctx_make("lg_remove", id, 1));
@@ -741,7 +745,11 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber)
         pop_sep(box);
         GtkWidget *edit = gtk_button_new_with_label("Edit package…");
         gtk_widget_add_css_class(edit, "flat");
-        g_object_set_data(G_OBJECT(edit), "pid", (gpointer)(intptr_t)id);
+        /* Heap-allocate the id so the full 64 bits survive; packing it into a
+         * gpointer would truncate on 32-bit targets where pointers are 4 bytes. */
+        gint64 *pidp = g_new(gint64, 1);
+        *pidp = id;
+        g_object_set_data_full(G_OBJECT(edit), "pid", pidp, g_free);
         g_signal_connect(edit, "clicked", G_CALLBACK(on_pkg_edit_clicked), &g_app);
         gtk_box_append(GTK_BOX(box), edit);
         pop_add(box, pop, "Remove package", ctx_make("rm", id, 1));
@@ -1333,7 +1341,8 @@ static void on_pkg_edit_response(AdwAlertDialog *d, const char *response, gpoint
 static void on_pkg_edit_clicked(GtkButton *b, gpointer user)
 {
     App *a = user;
-    long long id = (long long)(intptr_t)g_object_get_data(G_OBJECT(b), "pid");
+    const gint64 *pidp = g_object_get_data(G_OBJECT(b), "pid");
+    long long id = pidp ? (long long)*pidp : 0;
     GtkWidget *pop = gtk_widget_get_ancestor(GTK_WIDGET(b), GTK_TYPE_POPOVER);
     if (pop) gtk_popover_popdown(GTK_POPOVER(pop));
 
