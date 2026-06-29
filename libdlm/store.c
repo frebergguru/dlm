@@ -8,7 +8,48 @@
 
 struct dlm_store {
     sqlite3 *db;
+    /* Prepared-statement cache. The daemon only ever touches the store from its
+     * main thread (workers update in-memory item fields under the queue mutex;
+     * every dlm_store_* call comes from the tick/IPC path), so no locking is
+     * needed. Keyed by the SQL string-literal pointer: every call site passes a
+     * stable static literal, so pointer identity is a valid key. */
+    struct { const char *sql; sqlite3_stmt *st; } cache[32];
+    int ncache;
 };
+
+/* Return a reset, binding-cleared statement for `sql`, preparing and caching it
+ * on first use. `sql` must be a stable pointer (a static string literal at every
+ * call site). Returns NULL only if the prepare itself fails. The returned
+ * statement is owned by the cache — callers reset (not finalize) after use. */
+static sqlite3_stmt *prep(dlm_store *s, const char *sql)
+{
+    for (int i = 0; i < s->ncache; i++) {
+        if (s->cache[i].sql == sql) {
+            sqlite3_stmt *st = s->cache[i].st;
+            sqlite3_reset(st);
+            sqlite3_clear_bindings(st);
+            return st;
+        }
+    }
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &st, NULL) != SQLITE_OK) {
+        DLM_ERROR("store: prepare failed: %s", sqlite3_errmsg(s->db));
+        return NULL;
+    }
+    int cap = (int)(sizeof s->cache / sizeof s->cache[0]);
+    if (s->ncache == cap) {
+        /* The SQL set is closed and small (~19 distinct), so this is unreachable
+         * in practice; stay correct anyway by evicting the oldest entry. */
+        sqlite3_finalize(s->cache[0].st);
+        memmove(&s->cache[0], &s->cache[1],
+                (size_t)(cap - 1) * sizeof s->cache[0]);
+        s->ncache--;
+    }
+    s->cache[s->ncache].sql = sql;
+    s->cache[s->ncache].st = st;
+    s->ncache++;
+    return st;
+}
 
 static const char *SCHEMA =
     "PRAGMA journal_mode=WAL;"
@@ -46,6 +87,14 @@ static const char *SCHEMA =
     "  created_at INTEGER NOT NULL DEFAULT 0"
     ");";
 
+/* Indexes for the columns the queue filters/orders by. Run *after* MIGRATIONS
+ * so the columns exist on databases upgraded from an older schema. CREATE ... IF
+ * NOT EXISTS makes this idempotent. */
+static const char *INDEXES =
+    "CREATE INDEX IF NOT EXISTS idx_downloads_package ON downloads(package_id);"
+    "CREATE INDEX IF NOT EXISTS idx_downloads_list ON downloads(list);"
+    "CREATE INDEX IF NOT EXISTS idx_downloads_position ON downloads(position);";
+
 /* Best-effort migrations for databases created by older schemas. Each ALTER is
  * run independently and its "duplicate column" error ignored, so upgrading an
  * existing queue.db just adds the missing columns. */
@@ -81,6 +130,8 @@ dlm_store *dlm_store_open(const char *path)
     /* migrate older databases; "duplicate column" errors are expected & ignored */
     for (int i = 0; MIGRATIONS[i]; i++)
         sqlite3_exec(db, MIGRATIONS[i], NULL, NULL, NULL);
+    /* now that all columns exist, create the indexes */
+    sqlite3_exec(db, INDEXES, NULL, NULL, NULL);
     dlm_store *s = dlm_xcalloc(1, sizeof *s);
     s->db = db;
     return s;
@@ -89,8 +140,27 @@ dlm_store *dlm_store_open(const char *path)
 void dlm_store_close(dlm_store *s)
 {
     if (!s) return;
+    /* finalize cached statements before closing (sqlite3_close fails BUSY
+     * otherwise) */
+    for (int i = 0; i < s->ncache; i++)
+        sqlite3_finalize(s->cache[i].st);
     sqlite3_close(s->db);
     free(s);
+}
+
+int dlm_store_begin(dlm_store *s)
+{
+    return sqlite3_exec(s->db, "BEGIN;", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+}
+
+int dlm_store_commit(dlm_store *s)
+{
+    return sqlite3_exec(s->db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
+}
+
+int dlm_store_rollback(dlm_store *s)
+{
+    return sqlite3_exec(s->db, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK ? 0 : -1;
 }
 
 int64_t dlm_store_add(dlm_store *s, const char *url, const char *out_path,
@@ -113,13 +183,13 @@ int64_t dlm_store_add(dlm_store *s, const char *url, const char *out_path,
 
 int64_t dlm_store_add_full(dlm_store *s, const dlm_store_row *row)
 {
-    sqlite3_stmt *st = NULL;
     const char *sql =
         "INSERT INTO downloads(url,out_path,connections,delegate,total,"
         "downloaded,state,created_at,package_id,priority,enabled,list,name,"
         "availability,position,force,autostart) "
         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-    if (sqlite3_prepare_v2(s->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = prep(s, sql);
+    if (!st) return -1;
     int i = 1;
     sqlite3_bind_text(st, i++, row->url, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, i++, row->out_path, -1, SQLITE_TRANSIENT);
@@ -143,7 +213,7 @@ int64_t dlm_store_add_full(dlm_store *s, const dlm_store_row *row)
     sqlite3_bind_int(st, i++, row->force);
     sqlite3_bind_int(st, i++, row->autostart);
     int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
     if (rc != SQLITE_DONE) {
         DLM_ERROR("store: add failed: %s", sqlite3_errmsg(s->db));
         return -1;
@@ -154,44 +224,44 @@ int64_t dlm_store_add_full(dlm_store *s, const dlm_store_row *row)
 int dlm_store_set_progress(dlm_store *s, int64_t id, int64_t total,
                            int64_t downloaded)
 {
-    sqlite3_stmt *st = NULL;
     const char *sql = total >= 0
         ? "UPDATE downloads SET total=?,downloaded=? WHERE id=?;"
         : "UPDATE downloads SET downloaded=? WHERE id=?;";
-    if (sqlite3_prepare_v2(s->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = prep(s, sql);
+    if (!st) return -1;
     int i = 1;
     if (total >= 0) sqlite3_bind_int64(st, i++, total);
     sqlite3_bind_int64(st, i++, downloaded);
     sqlite3_bind_int64(st, i++, id);
     int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
 int dlm_store_set_state(dlm_store *s, int64_t id, const char *state,
                         const char *error)
 {
-    sqlite3_stmt *st = NULL;
     const char *sql = "UPDATE downloads SET state=?,error=? WHERE id=?;";
-    if (sqlite3_prepare_v2(s->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = prep(s, sql);
+    if (!st) return -1;
     sqlite3_bind_text(st, 1, state, -1, SQLITE_TRANSIENT);
     if (error) sqlite3_bind_text(st, 2, error, -1, SQLITE_TRANSIENT);
     else sqlite3_bind_null(st, 2);
     sqlite3_bind_int64(st, 3, id);
     int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
 /* Shared helper: run "UPDATE downloads SET <col>=? WHERE id=?" with an int64. */
 static int set_int_field(dlm_store *s, const char *sql, int64_t val, int64_t id)
 {
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(s->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = prep(s, sql);
+    if (!st) return -1;
     sqlite3_bind_int64(st, 1, val);
     sqlite3_bind_int64(st, 2, id);
     int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
@@ -233,37 +303,33 @@ int dlm_store_set_package(dlm_store *s, int64_t id, int64_t package_id)
 
 int dlm_store_set_list(dlm_store *s, int64_t id, const char *list)
 {
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(s->db, "UPDATE downloads SET list=? WHERE id=?;", -1,
-                           &st, NULL) != SQLITE_OK)
-        return -1;
+    sqlite3_stmt *st = prep(s, "UPDATE downloads SET list=? WHERE id=?;");
+    if (!st) return -1;
     sqlite3_bind_text(st, 1, list, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, id);
     int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
 int dlm_store_delete(dlm_store *s, int64_t id)
 {
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(s->db, "DELETE FROM downloads WHERE id=?;", -1, &st,
-                           NULL) != SQLITE_OK)
-        return -1;
+    sqlite3_stmt *st = prep(s, "DELETE FROM downloads WHERE id=?;");
+    if (!st) return -1;
     sqlite3_bind_int64(st, 1, id);
     int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
 int dlm_store_load_all(dlm_store *s, dlm_store_row_cb cb, void *userdata)
 {
-    sqlite3_stmt *st = NULL;
     const char *sql =
         "SELECT id,url,out_path,connections,delegate,total,downloaded,state,"
         "error,created_at,package_id,priority,enabled,list,name,availability,"
         "position,force,autostart FROM downloads ORDER BY position,id;";
-    if (sqlite3_prepare_v2(s->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = prep(s, sql);
+    if (!st) return -1;
     while (sqlite3_step(st) == SQLITE_ROW) {
         dlm_store_row row;
         row.id = sqlite3_column_int64(st, 0);
@@ -287,7 +353,7 @@ int dlm_store_load_all(dlm_store *s, dlm_store_row_cb cb, void *userdata)
         row.autostart = sqlite3_column_int(st, 18);
         cb(userdata, &row);
     }
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
     return 0;
 }
 
@@ -297,11 +363,11 @@ int64_t dlm_store_pkg_add(dlm_store *s, const char *name, const char *folder,
                           const char *comment, const char *list, int priority,
                           int64_t position, int64_t created_at)
 {
-    sqlite3_stmt *st = NULL;
     const char *sql =
         "INSERT INTO packages(name,folder,comment,list,priority,position,"
         "created_at) VALUES(?,?,?,?,?,?,?);";
-    if (sqlite3_prepare_v2(s->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = prep(s, sql);
+    if (!st) return -1;
     sqlite3_bind_text(st, 1, name ? name : "", -1, SQLITE_TRANSIENT);
     if (folder) sqlite3_bind_text(st, 2, folder, -1, SQLITE_TRANSIENT);
     else sqlite3_bind_null(st, 2);
@@ -312,7 +378,7 @@ int64_t dlm_store_pkg_add(dlm_store *s, const char *name, const char *folder,
     sqlite3_bind_int64(st, 6, position);
     sqlite3_bind_int64(st, 7, created_at);
     int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
     if (rc != SQLITE_DONE) {
         DLM_ERROR("store: pkg add failed: %s", sqlite3_errmsg(s->db));
         return -1;
@@ -324,12 +390,12 @@ int dlm_store_pkg_update(dlm_store *s, int64_t id, const char *name,
                          const char *folder, const char *comment, int priority,
                          int collapsed)
 {
-    sqlite3_stmt *st = NULL;
     const char *sql =
         "UPDATE packages SET "
         "name=COALESCE(?,name),folder=COALESCE(?,folder),"
         "comment=COALESCE(?,comment),priority=?,collapsed=? WHERE id=?;";
-    if (sqlite3_prepare_v2(s->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = prep(s, sql);
+    if (!st) return -1;
     if (name) sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
     else sqlite3_bind_null(st, 1);
     if (folder) sqlite3_bind_text(st, 2, folder, -1, SQLITE_TRANSIENT);
@@ -340,55 +406,49 @@ int dlm_store_pkg_update(dlm_store *s, int64_t id, const char *name,
     sqlite3_bind_int(st, 5, collapsed ? 1 : 0);
     sqlite3_bind_int64(st, 6, id);
     int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
 int dlm_store_pkg_set_list(dlm_store *s, int64_t id, const char *list)
 {
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(s->db, "UPDATE packages SET list=? WHERE id=?;", -1,
-                           &st, NULL) != SQLITE_OK)
-        return -1;
+    sqlite3_stmt *st = prep(s, "UPDATE packages SET list=? WHERE id=?;");
+    if (!st) return -1;
     sqlite3_bind_text(st, 1, list, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, id);
     int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
 int dlm_store_pkg_set_position(dlm_store *s, int64_t id, int64_t position)
 {
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(s->db, "UPDATE packages SET position=? WHERE id=?;",
-                           -1, &st, NULL) != SQLITE_OK)
-        return -1;
+    sqlite3_stmt *st = prep(s, "UPDATE packages SET position=? WHERE id=?;");
+    if (!st) return -1;
     sqlite3_bind_int64(st, 1, position);
     sqlite3_bind_int64(st, 2, id);
     int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
 int dlm_store_pkg_delete(dlm_store *s, int64_t id)
 {
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(s->db, "DELETE FROM packages WHERE id=?;", -1, &st,
-                           NULL) != SQLITE_OK)
-        return -1;
+    sqlite3_stmt *st = prep(s, "DELETE FROM packages WHERE id=?;");
+    if (!st) return -1;
     sqlite3_bind_int64(st, 1, id);
     int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
 int dlm_store_pkg_load_all(dlm_store *s, dlm_store_pkg_cb cb, void *userdata)
 {
-    sqlite3_stmt *st = NULL;
     const char *sql =
         "SELECT id,name,folder,comment,list,priority,collapsed,position,"
         "created_at FROM packages ORDER BY position,id;";
-    if (sqlite3_prepare_v2(s->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = prep(s, sql);
+    if (!st) return -1;
     while (sqlite3_step(st) == SQLITE_ROW) {
         dlm_store_pkg_row row;
         row.id = sqlite3_column_int64(st, 0);
@@ -402,6 +462,6 @@ int dlm_store_pkg_load_all(dlm_store *s, dlm_store_pkg_cb cb, void *userdata)
         row.created_at = sqlite3_column_int64(st, 8);
         cb(userdata, &row);
     }
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
     return 0;
 }

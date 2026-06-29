@@ -532,12 +532,20 @@ int64_t dlm_queue_grab(dlm_queue *q, const char *package_name,
     if (!links || count <= 0) return -1;
     pthread_mutex_lock(&q->mu);
 
+    /* One transaction for the package + all its links: a single commit/fsync
+     * instead of one per row, which matters for large crawls. */
+    dlm_store_begin(q->store);
+
     int64_t pos = q->next_pos++;
     int64_t pkg_id = dlm_store_pkg_add(q->store,
                                        package_name ? package_name : "links",
                                        folder, NULL, "linkgrabber",
                                        DLM_PRIO_DEFAULT, pos, time(NULL));
-    if (pkg_id <= 0) { pthread_mutex_unlock(&q->mu); return -1; }
+    if (pkg_id <= 0) {
+        dlm_store_rollback(q->store);
+        pthread_mutex_unlock(&q->mu);
+        return -1;
+    }
     pkg *p = calloc(1, sizeof *p);
     p->id = pkg_id;
     p->name = xstrdup(package_name ? package_name : "links");
@@ -590,6 +598,7 @@ int64_t dlm_queue_grab(dlm_queue *q, const char *package_name,
         }
         free(derived);
     }
+    dlm_store_commit(q->store);
     pthread_mutex_unlock(&q->mu);
     return pkg_id;
 }
@@ -1153,6 +1162,33 @@ void dlm_queue_tick(dlm_queue *q)
     pthread_mutex_unlock(&q->mu);
 }
 
+int dlm_queue_has_pending_work(dlm_queue *q)
+{
+    pthread_mutex_lock(&q->mu);
+    int pending = 0;
+
+    /* a running worker means progress to persist and an eventual reap */
+    int active = 0;
+    for (int i = 0; i < q->n; i++)
+        if (q->items[i]->has_thread) { active++; pending = 1; }
+
+    /* a forced link starts unconditionally on the next tick */
+    for (int i = 0; i < q->n && !pending; i++) {
+        qitem *it = q->items[i];
+        if (it->force && it->list == DLM_LIST_DOWNLOAD &&
+            it->state == Q_QUEUED && !it->has_thread && it->enabled)
+            pending = 1;
+    }
+
+    /* an eligible link can be auto-started if a slot is free */
+    if (!pending && q->global_autostart && active < q->max_active)
+        for (int i = 0; i < q->n && !pending; i++)
+            if (eligible(q->items[i])) pending = 1;
+
+    pthread_mutex_unlock(&q->mu);
+    return pending;
+}
+
 /* ---- snapshot / introspection ----------------------------------------- */
 
 /* qsort comparators ordering by position then id (stable display order). */
@@ -1167,6 +1203,15 @@ static int cmp_pkg_pos(const void *a, const void *b)
 {
     const pkg *x = *(pkg *const *)a, *y = *(pkg *const *)b;
     if (x->position != y->position) return x->position < y->position ? -1 : 1;
+    return x->id < y->id ? -1 : x->id > y->id ? 1 : 0;
+}
+
+/* (package id -> output slot) pair, sorted by id so per-package link counts can
+ * be tallied in one O(n log p) pass instead of an O(n*p) nested scan. */
+typedef struct { int64_t id; int slot; } pkg_idslot;
+static int cmp_idslot(const void *a, const void *b)
+{
+    const pkg_idslot *x = a, *y = b;
     return x->id < y->id ? -1 : x->id > y->id ? 1 : 0;
 }
 
@@ -1225,6 +1270,7 @@ int dlm_queue_packages(dlm_queue *q, dlm_psnap **out, int *count)
     pkg **ord = malloc((size_t)(q->npkg ? q->npkg : 1) * sizeof *ord);
     for (int i = 0; i < q->npkg; i++) ord[i] = q->pkgs[i];
     qsort(ord, (size_t)q->npkg, sizeof *ord, cmp_pkg_pos);
+    pkg_idslot *map = malloc((size_t)(q->npkg ? q->npkg : 1) * sizeof *map);
     for (int i = 0; i < q->npkg; i++) {
         pkg *p = ord[i];
         arr[i].id = p->id;
@@ -1234,11 +1280,24 @@ int dlm_queue_packages(dlm_queue *q, dlm_psnap **out, int *count)
         arr[i].list = p->list;
         arr[i].priority = p->priority;
         arr[i].collapsed = p->collapsed;
-        int c = 0;
-        for (int j = 0; j < q->n; j++)
-            if (q->items[j]->package_id == p->id) c++;
-        arr[i].link_count = c;
+        arr[i].link_count = 0;
+        map[i].id = p->id;
+        map[i].slot = i;
     }
+    /* Tally links per package in one pass: sort the id->slot map, then binary
+     * search each item's package_id (O(n log p) vs the old O(n*p)). */
+    qsort(map, (size_t)q->npkg, sizeof *map, cmp_idslot);
+    for (int j = 0; j < q->n; j++) {
+        int64_t pid = q->items[j]->package_id;
+        int lo = 0, hi = q->npkg - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (map[mid].id < pid) lo = mid + 1;
+            else if (map[mid].id > pid) hi = mid - 1;
+            else { arr[map[mid].slot].link_count++; break; }
+        }
+    }
+    free(map);
     free(ord);
     *count = q->npkg;
     *out = arr;

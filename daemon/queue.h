@@ -180,6 +180,12 @@ int dlm_queue_clear_finished(dlm_queue *q);
 /* Reap finished workers and start eligible items. Call regularly (e.g. 200ms). */
 void dlm_queue_tick(dlm_queue *q);
 
+/* True if dlm_queue_tick() has anything to do soon: a worker is running (needs
+ * progress persistence + reaping) or a queued item could be started now. When
+ * this is false the daemon can block in poll() instead of spinning on a timer,
+ * because new work only ever arrives via a client command (which wakes poll). */
+int dlm_queue_has_pending_work(dlm_queue *q);
+
 /* Allocate a snapshot array of all links. Free with dlm_queue_snapshot_free. */
 int dlm_queue_snapshot(dlm_queue *q, dlm_qsnap **out, int *count);
 void dlm_queue_snapshot_free(dlm_qsnap *snap, int count);

@@ -202,11 +202,22 @@ int main(int argc, char **argv)
     double last_progress = 0;
     double last_tools = 0;
 
+    /* pollfd array reused across iterations (grown as clients connect) so an
+     * idle daemon does no per-tick allocation. */
+    struct dlm_pollfd *pfd = NULL;
+    int pfd_cap = 0;
+
     while (!g_stop) {
         int nclients = clients.n;
         int nfds = 1 + nclients;
-        struct dlm_pollfd *pfd = calloc((size_t)nfds, sizeof *pfd);
-        if (!pfd) { dlm_sleep_ms(TICK_MS); continue; } /* transient OOM: retry next tick */
+        if (nfds > pfd_cap) {
+            int ncap = pfd_cap ? pfd_cap : 8;
+            while (ncap < nfds) ncap *= 2;
+            struct dlm_pollfd *np = realloc(pfd, (size_t)ncap * sizeof *pfd);
+            if (!np) { dlm_sleep_ms(TICK_MS); continue; } /* transient OOM */
+            pfd = np;
+            pfd_cap = ncap;
+        }
         pfd[0].fd = lfd;
         pfd[0].events = DLM_POLLIN;
         for (int i = 0; i < nclients; i++) {
@@ -215,8 +226,33 @@ int main(int argc, char **argv)
             if (clients.v[i].outlen > 0) pfd[i + 1].events |= DLM_POLLOUT;
         }
 
-        int r = dlm_poll(pfd, (unsigned)nfds, TICK_MS);
-        if (r < 0 && !dlm_sock_was_intr()) { perror("poll"); free(pfd); break; }
+        /* Adaptive poll timeout. Tick cadence only while the scheduler has work
+         * (active workers or startable items); the progress cadence while a
+         * subscriber is attached; otherwise block until a client speaks — poll
+         * wakes on any socket activity, and new downloads only arrive via a
+         * client command. Capped at the next hourly tools check so it still
+         * fires when idle. This keeps an idle daemon at ~0% CPU instead of
+         * waking 1000/TICK_MS times a second. */
+        int timeout;
+        if (dlm_queue_has_pending_work(q)) {
+            timeout = TICK_MS;
+        } else {
+            int has_sub = 0;
+            for (int i = 0; i < clients.n; i++)
+                if (clients.v[i].subscribed) { has_sub = 1; break; }
+            if (has_sub) {
+                timeout = (int)(PROGRESS_INTERVAL * 1000);
+            } else if (last_tools == 0) {
+                timeout = 0; /* run the startup tools check immediately */
+            } else {
+                double wait = (last_tools + TOOLS_CHECK_INTERVAL) - dlm_now();
+                if (wait < 1.0) wait = 1.0;
+                timeout = (int)(wait * 1000);
+            }
+        }
+
+        int r = dlm_poll(pfd, (unsigned)nfds, timeout);
+        if (r < 0 && !dlm_sock_was_intr()) { perror("poll"); break; }
 
         /* accept new connections (drain the backlog; lfd is non-blocking) */
         if (r > 0 && (pfd[0].revents & DLM_POLLIN)) {
@@ -268,8 +304,6 @@ int main(int argc, char **argv)
         }
         if (shutdown_req) g_stop = 1;
 
-        free(pfd);
-
         /* scheduler tick */
         dlm_queue_tick(q);
 
@@ -306,6 +340,7 @@ int main(int argc, char **argv)
             if (clients.v[i].gone) clients_remove(&clients, i);
     }
 
+    free(pfd);
     fprintf(stderr, "\ndlmd: shutting down (pausing %d active)\n",
             dlm_queue_active_count(q));
     for (int i = 0; i < clients.n; i++) {

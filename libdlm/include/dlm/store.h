@@ -67,6 +67,13 @@ typedef void (*dlm_store_pkg_cb)(void *userdata, const dlm_store_pkg_row *row);
 dlm_store *dlm_store_open(const char *path);
 void dlm_store_close(dlm_store *s);
 
+/* Group a burst of writes into one transaction (one commit/fsync instead of
+ * one per row). Use around bulk inserts; pair begin with commit (or rollback on
+ * error). Each returns 0 on success, -1 on failure. */
+int dlm_store_begin(dlm_store *s);
+int dlm_store_commit(dlm_store *s);
+int dlm_store_rollback(dlm_store *s);
+
 /* Insert a new queued download-list link with default grouping (no package,
  * default priority, enabled, availability unknown); returns its id or -1. */
 int64_t dlm_store_add(dlm_store *s, const char *url, const char *out_path,
