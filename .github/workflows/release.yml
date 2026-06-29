@@ -11,15 +11,16 @@ on:
 permissions:
   contents: write          # needed to create the release
 
-# All actions below are pinned to majors that run on Node 20 (checkout@v4,
-# upload/download-artifact@v4, action-gh-release@v2) — no deprecated runtimes.
+# Actions are pinned to majors that run on Node 24 (checkout@v7,
+# upload-artifact@v7, download-artifact@v8); the release is published with the
+# gh CLI (a plain run step, no JS action) so nothing can be deprecated.
 
 jobs:
   appimage:
     name: Linux AppImage
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -33,7 +34,7 @@ jobs:
         run: |
           export VERSION="${GITHUB_REF_NAME#v}"
           ./installer/appimage/build-appimage.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: appimage
           path: dist/*.AppImage
@@ -43,12 +44,12 @@ jobs:
     name: Windows installers (x64 + x86)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build Windows installers (Docker)
         run: |
           export VERSION="${GITHUB_REF_NAME#v}"
           ./build-win.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: dist/*.exe
@@ -60,14 +61,17 @@ jobs:
     runs-on: ubuntu-24.04
     if: github.ref_type == 'tag'      # only publish for an actual version tag
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Create / update the GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            artifacts/**/*.AppImage
-            artifacts/**/*.exe
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          files=(artifacts/appimage/*.AppImage artifacts/windows/*.exe)
+          ls -lh "${files[@]}"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" --generate-notes "${files[@]}" \
+            || gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --clobber "${files[@]}"
