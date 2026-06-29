@@ -17,7 +17,17 @@ image-build time.
 ## Build
 
 ```sh
-# from the repo root
+# from the repo root — builds the image if needed, then both installers
+./build-win.sh
+
+# force a fresh image, or stamp a version:
+./build-win.sh --rebuild
+VERSION=1.2.3 ./build-win.sh
+```
+
+Equivalent manual invocation:
+
+```sh
 docker build -t dlm-winbuild installer/windows
 docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/out dlm-winbuild
 ```
