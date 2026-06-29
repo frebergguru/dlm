@@ -696,8 +696,13 @@ static int cmd_watch(void)
     char *resp = dlm_client_rpc(fd, "{\"cmd\":\"subscribe\"}");
     json_t *root = parse_resp(resp);
     if (root) { render_downloads(root, "download", 1); json_decref(root); }
+    /* Stream events through a buffered reader (chunked recv) rather than a
+     * syscall per byte. The subscribe RPC above consumed exactly its one
+     * response line, so the reader starts on a clean stream. */
+    dlm_client_reader rd;
+    dlm_client_reader_init(&rd, fd);
     while (!g_cancel) {
-        char *line = dlm_client_read_line(fd);
+        char *line = dlm_client_reader_line(&rd);
         if (!line) break;
         json_error_t e;
         json_t *ev = json_loads(line, 0, &e);

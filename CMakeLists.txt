@@ -5,8 +5,11 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Default to an optimized build. build.sh already passes Release explicitly;
+# this only affects a bare `cmake -B build` (which previously produced an
+# unoptimized -O0 Debug binary).
 if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Debug)
+  set(CMAKE_BUILD_TYPE Release)
 endif()
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
@@ -16,6 +19,51 @@ option(DLM_ASAN "Build with AddressSanitizer" OFF)
 if(DLM_ASAN)
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
   add_link_options(-fsanitize=address,undefined)
+endif()
+
+# ---- size/speed codegen (skipped under ASAN, which wants its own flags) ----
+# These are portable GCC/Clang/MinGW flags only; nothing CPU-specific is enabled
+# by default so the release artifacts (AppImage + Windows) stay portable. Tuning
+# for the build host is opt-in via -DDLM_NATIVE=ON.
+if(NOT DLM_ASAN)
+  # Place each function/datum in its own section and let the linker drop the
+  # ones nothing references -> smaller binaries and lower resident memory.
+  include(CheckCCompilerFlag)
+  check_c_compiler_flag("-ffunction-sections" DLM_HAS_FUNCTION_SECTIONS)
+  if(DLM_HAS_FUNCTION_SECTIONS)
+    add_compile_options(-ffunction-sections -fdata-sections)
+    if(APPLE)
+      add_link_options(-Wl,-dead_strip)
+    else()
+      add_link_options(-Wl,--gc-sections)
+    endif()
+  endif()
+
+  # Link-time optimization for optimized configs. Verified available before use
+  # so a toolchain without LTO support just builds normally.
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT DLM_IPO_OK OUTPUT DLM_IPO_MSG)
+  if(DLM_IPO_OK)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO TRUE)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL TRUE)
+  else()
+    message(STATUS "LTO not available: ${DLM_IPO_MSG}")
+  endif()
+
+  # Strip symbols from non-debug builds (smaller on-disk + mapped size).
+  if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+    add_link_options(-s)
+  endif()
+
+  # Opt-in host tuning (NOT for distributable binaries).
+  option(DLM_NATIVE "Tune codegen for the build host (-march=native)" OFF)
+  if(DLM_NATIVE)
+    check_c_compiler_flag("-march=native" DLM_HAS_MARCH_NATIVE)
+    if(DLM_HAS_MARCH_NATIVE)
+      add_compile_options(-march=native)
+    endif()
+  endif()
 endif()
 
 find_package(PkgConfig REQUIRED)

@@ -13,6 +13,7 @@
 typedef struct {
     char *data;
     size_t len;
+    size_t cap; /* allocated bytes (>= len + 1) */
 } membuf;
 
 static size_t write_mem(char *ptr, size_t size, size_t nmemb, void *userp)
@@ -20,7 +21,15 @@ static size_t write_mem(char *ptr, size_t size, size_t nmemb, void *userp)
     membuf *m = userp;
     size_t add = size * nmemb;
     if (m->len + add > HTTPGET_MAX) return 0;
-    m->data = dlm_xrealloc(m->data, m->len + add + 1);
+    size_t need = m->len + add + 1; /* + NUL terminator */
+    if (need > m->cap) {
+        /* grow geometrically so a body assembled from many small chunks costs
+         * O(n) total instead of O(n^2) reallocs/copies */
+        size_t nc = m->cap ? m->cap : 4096;
+        while (nc < need) nc *= 2;
+        m->data = dlm_xrealloc(m->data, nc);
+        m->cap = nc;
+    }
     memcpy(m->data + m->len, ptr, add);
     m->len += add;
     m->data[m->len] = '\0';
@@ -51,7 +60,7 @@ static int http_do(const char *url, const char *post_fields,
     CURL *c = curl_easy_init();
     if (!c) return DLM_ERR_NOMEM;
 
-    membuf m = {NULL, 0};
+    membuf m = {NULL, 0, 0};
     int hl_ok = 1;
     struct curl_slist *hl = build_list(headers, &hl_ok);
     if (!hl_ok) { curl_easy_cleanup(c); return DLM_ERR_NOMEM; }

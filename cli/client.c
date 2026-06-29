@@ -140,7 +140,7 @@ static int write_all(int fd, const char *s, size_t len)
 
 char *dlm_client_read_line(int fd)
 {
-    size_t cap = 256, len = 0;
+    size_t cap = 4096, len = 0;
     char *buf = malloc(cap);
     if (!buf) return NULL;
     for (;;) {
@@ -166,6 +166,47 @@ char *dlm_client_read_line(int fd)
     }
     buf[len] = '\0';
     return buf;
+}
+
+void dlm_client_reader_init(dlm_client_reader *r, int fd)
+{
+    r->fd = fd;
+    r->start = r->end = 0;
+}
+
+char *dlm_client_reader_line(dlm_client_reader *r)
+{
+    size_t cap = 4096, len = 0;
+    char *line = malloc(cap);
+    if (!line) return NULL;
+    for (;;) {
+        /* emit from the buffered window up to a newline */
+        while (r->start < r->end) {
+            char c = r->buf[r->start++];
+            if (c == '\n') { line[len] = '\0'; return line; }
+            if (len + 1 >= cap) {
+                char *nb = realloc(line, cap * 2);
+                if (!nb) { free(line); return NULL; }
+                line = nb;
+                cap *= 2;
+            }
+            line[len++] = c;
+        }
+        /* window drained: refill in one syscall */
+        long got = dlm_sock_read((dlm_sock_t)r->fd, r->buf, sizeof r->buf);
+        if (got < 0) {
+            if (dlm_sock_was_intr()) continue;
+            free(line);
+            return NULL;
+        }
+        if (got == 0) { /* EOF */
+            if (len == 0) { free(line); return NULL; }
+            line[len] = '\0';
+            return line;
+        }
+        r->start = 0;
+        r->end = (size_t)got;
+    }
 }
 
 char *dlm_client_rpc(int fd, const char *req)
