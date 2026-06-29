@@ -3,7 +3,13 @@
 # build.sh — configure, build and test dlm.
 #
 # Usage:
-#   ./build.sh [extra cmake args...]
+#   ./build.sh [extra cmake args...]   # clean build, then build + test
+#   ./build.sh --clean                 # remove the build tree and exit
+#
+# Flags:
+#   --clean              remove BUILD_DIR and exit without building (mirrors
+#                        build-win.sh --clean). Note a normal run already does a
+#                        clean build by default; set KEEP_BUILD=1 for incremental.
 #
 # Environment overrides:
 #   BUILD_DIR=build      build directory
@@ -24,6 +30,35 @@ BUILD_DIR="${BUILD_DIR:-build}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 JOBS="${JOBS:-$( (command -v nproc >/dev/null && nproc) || echo 4)}"
 
+# Remove the build tree, failing loudly if root-owned artifacts block it (left
+# by a prior 'sudo ./install.sh').
+clean_build_dir() {
+  [ -e "$BUILD_DIR" ] || return 0
+  echo "==> Cleaning $BUILD_DIR/"
+  rm -rf "$BUILD_DIR" 2>/dev/null || true
+  if [ -e "$BUILD_DIR" ]; then
+    echo "   ERROR: could not remove $BUILD_DIR/ — likely root-owned files from a"
+    echo "   prior 'sudo ./install.sh'. Remove it manually, then re-run:"
+    echo "       sudo rm -rf $BUILD_DIR"
+    exit 1
+  fi
+}
+
+# A clean build is the default; KEEP_BUILD=1 opts into an incremental build.
+clean=1
+[ "${KEEP_BUILD:-0}" = "1" ] && clean=0
+
+# Parse our own flags; everything else is forwarded to cmake.
+passthrough=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --clean)   clean_build_dir; echo ">>> clean done"; exit 0 ;;
+    -h|--help) sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)         passthrough+=("$1") ;;
+  esac
+  shift
+done
+
 cmake_args=(-DCMAKE_BUILD_TYPE="$BUILD_TYPE")
 [ "${NO_GUI:-0}" = "1" ] && cmake_args+=(-DDLM_GUI=OFF)
 [ "${ASAN:-0}" = "1" ]  && cmake_args+=(-DDLM_ASAN=ON)
@@ -35,7 +70,7 @@ if [ "${NO_SYSTEMD:-0}" = "1" ]; then
 else
   cmake_args+=(-DDLM_INSTALL_SYSTEMD=ON)
 fi
-cmake_args+=("$@")
+cmake_args+=(${passthrough[@]+"${passthrough[@]}"})
 
 # ---- dependency check (informative, non-fatal) --------------------------
 echo "==> Checking dependencies"
@@ -60,16 +95,7 @@ fi
 # ---- clean build tree ---------------------------------------------------
 # A clean build by default avoids stale CMake cache (e.g. a sticky option from a
 # previous run) and root-owned artifacts left by a prior 'sudo ./install.sh'.
-if [ "${KEEP_BUILD:-0}" != "1" ] && [ -e "$BUILD_DIR" ]; then
-  echo "==> Cleaning $BUILD_DIR/"
-  rm -rf "$BUILD_DIR" 2>/dev/null || true
-  if [ -e "$BUILD_DIR" ]; then
-    echo "   ERROR: could not remove $BUILD_DIR/ — likely root-owned files from a"
-    echo "   prior 'sudo ./install.sh'. Remove it manually, then re-run:"
-    echo "       sudo rm -rf $BUILD_DIR"
-    exit 1
-  fi
-fi
+[ "$clean" = "1" ] && clean_build_dir
 
 # ---- configure + build + test ------------------------------------------
 echo "==> Configuring ($BUILD_TYPE) in $BUILD_DIR/"
