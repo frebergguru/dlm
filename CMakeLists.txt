@@ -110,11 +110,12 @@ install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/dlm)
 if(TARGET dlm-gui)
   install(TARGETS dlm-gui RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-  # desktop entry + icon so the GUI shows up in application menus
+  # desktop entry + the full hicolor icon set (guru.freberg.dlm.*) so the GUI
+  # shows up in application menus with a crisp icon at every size.
   install(FILES packaging/dlm.desktop
           DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
-  install(FILES packaging/dlm.svg
-          DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
+  install(DIRECTORY assets/linux/hicolor
+          DESTINATION ${CMAKE_INSTALL_DATADIR}/icons)
 endif()
 
 # optional systemd *user* service for dlmd (the daemon also auto-starts on

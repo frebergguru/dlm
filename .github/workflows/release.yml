@@ -1,0 +1,73 @@
+name: release
+
+# Build the AppImage (Linux) and both Windows installers (x64 + x86) and attach
+# them to a GitHub Release whenever a version tag (v*) is pushed.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:        # manual run to validate the build jobs without tagging
+
+permissions:
+  contents: write          # needed to create the release
+
+# All actions below are pinned to majors that run on Node 20 (checkout@v4,
+# upload/download-artifact@v4, action-gh-release@v2) — no deprecated runtimes.
+
+jobs:
+  appimage:
+    name: Linux AppImage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            libcurl4-openssl-dev libjansson-dev libsqlite3-dev \
+            libpcre2-dev libssl-dev libgtk-4-dev libadwaita-1-dev \
+            wget ca-certificates file patchelf desktop-file-utils \
+            librsvg2-bin libglib2.0-bin libgdk-pixbuf2.0-bin
+      - name: Build AppImage
+        run: |
+          export VERSION="${GITHUB_REF_NAME#v}"
+          ./installer/appimage/build-appimage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: dist/*.AppImage
+          if-no-files-found: error
+
+  windows:
+    name: Windows installers (x64 + x86)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Windows installers (Docker)
+        run: |
+          export VERSION="${GITHUB_REF_NAME#v}"
+          ./build-win.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [appimage, windows]
+    runs-on: ubuntu-24.04
+    if: github.ref_type == 'tag'      # only publish for an actual version tag
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create / update the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.AppImage
+            artifacts/**/*.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true

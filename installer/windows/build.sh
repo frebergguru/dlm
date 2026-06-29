@@ -122,6 +122,11 @@ build_arch() {
 
 make_icon() {
     [ -f /work/dlm.ico ] && return
+    if [ -f "$SRC/assets/icon.ico" ]; then
+        echo "### using assets/icon.ico"
+        cp "$SRC/assets/icon.ico" /work/dlm.ico
+        return
+    fi
     echo "### generating dlm.ico from packaging/dlm.svg"
     local png=() s
     for s in 16 24 32 48 64 128 256; do

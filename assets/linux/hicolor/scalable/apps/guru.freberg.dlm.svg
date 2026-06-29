@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="108" height="108" viewBox="0 0 108 108">
+  <defs>
+    <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="4" y1="0" x2="104" y2="108">
+      <stop offset="0" stop-color="#5A67E6"/>
+      <stop offset="1" stop-color="#272C8A"/>
+    </linearGradient>
+    <radialGradient id="glow" gradientUnits="userSpaceOnUse" cx="54" cy="32" r="76">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.219"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="arrow" gradientUnits="userSpaceOnUse" x1="54" y1="56" x2="54" y2="82">
+      <stop offset="0" stop-color="#73F1E7"/>
+      <stop offset="1" stop-color="#1BBED0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect x="0" y="0" width="108" height="108" fill="url(#bg)"/>
+  <rect x="0" y="0" width="108" height="108" fill="url(#glow)"/>
+
+  <!-- Shaft segment 1 (top) -->
+  <path fill="#FFFFFF" fill-opacity="0.7"
+    d="M48,20 L60,20 A3,3 0 0 1 63,23 L63,26 A3,3 0 0 1 60,29 L48,29 A3,3 0 0 1 45,26 L45,23 A3,3 0 0 1 48,20 Z"/>
+  <!-- Shaft segment 2 (middle) -->
+  <path fill="#FFFFFF" fill-opacity="0.85"
+    d="M48,32 L60,32 A3,3 0 0 1 63,35 L63,38 A3,3 0 0 1 60,41 L48,41 A3,3 0 0 1 45,38 L45,35 A3,3 0 0 1 48,32 Z"/>
+  <!-- Shaft segment 3 (bottom) -->
+  <path fill="#FFFFFF"
+    d="M48,44 L60,44 A3,3 0 0 1 63,47 L63,50 A3,3 0 0 1 60,53 L48,53 A3,3 0 0 1 45,50 L45,47 A3,3 0 0 1 48,44 Z"/>
+  <!-- Arrowhead -->
+  <path fill="url(#arrow)" d="M32,56 L76,56 L54,82 Z"/>
+  <!-- Storage shelf -->
+  <path fill="#FFFFFF" fill-opacity="0.95"
+    d="M46,85 L62,85 A2,2 0 0 1 64,87 A2,2 0 0 1 62,89 L46,89 A2,2 0 0 1 44,87 A2,2 0 0 1 46,85 Z"/>
+</svg>
