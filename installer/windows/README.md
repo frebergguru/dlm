@@ -23,6 +23,9 @@ image-build time.
 # force a fresh image, or stamp a version:
 ./build-win.sh --rebuild
 VERSION=1.2.3 ./build-win.sh
+
+# remove the produced installers and the build image:
+./build-win.sh --clean
 ```
 
 Equivalent manual invocation:

@@ -17,6 +17,14 @@ LIBADWAITA_TAG=${LIBADWAITA_TAG:-1.7.7}
 mkdir -p "$OUT"
 
 # arch label -> mingw triplet / sysroot / NSIS define
+if [ "${1:-}" = "--clean" ]; then
+    echo "### cleaning intermediate build/stage dirs and installer outputs"
+    rm -rf /work/build-* /work/stage-* /work/dlm.ico /work/i-*.png
+    rm -f "$OUT"/*.exe
+    echo "### clean"
+    exit 0
+fi
+
 declare -A TRIPLET=([x64]=x86_64-w64-mingw32 [x86]=i686-w64-mingw32)
 declare -A MESON_CPU=([x64]=x86_64 [x86]=x86)
 
