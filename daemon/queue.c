@@ -199,6 +199,27 @@ static void drop_if_empty(dlm_queue *q, int64_t package_id)
         }
 }
 
+/* Ensure the parent directory of `path` exists (the save layout now nests
+ * downloads under <dir>/<host>/<title>/, and neither the engine nor yt-dlp
+ * creates intermediate directories). */
+static void ensure_parent_dir(const char *path)
+{
+    if (!path) return;
+    const char *slash = strrchr(path, '/');
+#if defined(_WIN32)
+    const char *bs = strrchr(path, '\\');
+    if (bs && (!slash || bs > slash)) slash = bs;
+#endif
+    if (!slash || slash == path) return;        /* no dir component / root */
+    size_t len = (size_t)(slash - path);
+    char *dir = malloc(len + 1);
+    if (!dir) return;
+    memcpy(dir, path, len);
+    dir[len] = '\0';
+    dlm_mkdir_p(dir);
+    free(dir);
+}
+
 static void cleanup_partial_files(qitem *it)
 {
     if (!it->out_path) return;
@@ -342,6 +363,9 @@ static void *worker_main(void *arg)
     pthread_mutex_unlock(&q->mu);
     int64_t per = cap > 0 ? cap / slots : 0;
     if (cap > 0 && per < 1) per = 1;
+
+    /* create the (possibly nested) destination directory before writing */
+    ensure_parent_dir(it->out_path);
 
     dlm_result r;
     if (it->delegate) {
