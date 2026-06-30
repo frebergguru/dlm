@@ -6,9 +6,68 @@
 #include "dlm/dlm.h"
 
 #include <curl/curl.h>
+#include <ctype.h>
+#include <string.h>
 
 #define HTTPGET_UA "dlm/0.1 (+segmented-downloader)"
 #define HTTPGET_MAX (64 * 1024 * 1024) /* cap response bodies at 64 MiB */
+
+/* case-insensitive "does s start with prefix p?" */
+int dlm_ci_prefix(const char *s, const char *p)
+{
+    for (; *p; s++, p++)
+        if (tolower((unsigned char)*s) != tolower((unsigned char)*p)) return 0;
+    return 1;
+}
+
+/* Registrable-ish cookie domain ".<last two labels>" of the URL's host
+ * (e.g. https://archive.org/... or ia6.us.archive.org -> ".archive.org"). */
+static void cookie_domain_of(const char *url, char *buf, size_t n)
+{
+    const char *h = strstr(url, "://");
+    h = h ? h + 3 : url;
+    size_t hl = strcspn(h, "/:?#");
+    char host[256];
+    if (hl >= sizeof host) hl = sizeof host - 1;
+    memcpy(host, h, hl);
+    host[hl] = '\0';
+    const char *dom = host;
+    char *last = strrchr(host, '.');
+    if (last) {
+        *last = '\0';
+        char *prev = strrchr(host, '.');
+        *last = '.';
+        dom = prev ? prev + 1 : host;
+    }
+    snprintf(buf, n, ".%s", dom);
+}
+
+/* Attach a session cookie ("name=val; name2=val2") via libcurl's cookie engine,
+ * scoped to the request host's registrable domain and marked Secure. Unlike a
+ * raw "Cookie:" header (which libcurl re-sends verbatim on every redirect hop,
+ * including off-site and http downgrades), an engine cookie is sent ONLY to the
+ * matching domain over https — so it can't leak if a redirect leaves the site. */
+void dlm_curl_set_scoped_cookie(void *handle, const char *url, const char *cookie_value)
+{
+    CURL *c = handle;
+    if (!c || !cookie_value || !*cookie_value) return;
+    char domain[260];
+    cookie_domain_of(url, domain, sizeof domain);
+    curl_easy_setopt(c, CURLOPT_COOKIEFILE, ""); /* enable in-memory cookie engine */
+    char *dup = dlm_xstrdup(cookie_value);
+    char *save = NULL;
+    /* one Set-Cookie per pair: libcurl reads only the first "k=v" as the cookie
+     * and the rest of the line as attributes, so pairs must be split. */
+    for (char *tok = strtok_r(dup, ";", &save); tok; tok = strtok_r(NULL, ";", &save)) {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        if (!strchr(tok, '=')) continue;
+        char line[2048];
+        snprintf(line, sizeof line, "Set-Cookie: %s; domain=%s; path=/; secure",
+                 tok, domain);
+        curl_easy_setopt(c, CURLOPT_COOKIELIST, line);
+    }
+    free(dup);
+}
 
 typedef struct {
     char *data;
@@ -39,12 +98,23 @@ static size_t write_mem(char *ptr, size_t size, size_t nmemb, void *userp)
 /* Build a curl header list. *ok is set to 0 if an append fails (OOM): callers
  * must abort rather than silently send the request with headers dropped (which
  * for archive.org would downgrade an authenticated request to anonymous). */
-static struct curl_slist *build_list(const char *const *headers, int *ok)
+static struct curl_slist *build_list(const char *const *headers, int *ok,
+                                     char **cookie_out)
 {
     *ok = 1;
+    if (cookie_out) *cookie_out = NULL;
     struct curl_slist *l = NULL;
     if (!headers) return NULL;
     for (int i = 0; headers[i]; i++) {
+        /* pull any "Cookie:" header out of the raw list so it can go through the
+         * cookie engine (scoped + Secure) instead of leaking across redirects. */
+        if (cookie_out && dlm_ci_prefix(headers[i], "Cookie:")) {
+            const char *v = headers[i] + 7;
+            while (*v == ' ') v++;
+            free(*cookie_out);
+            *cookie_out = dlm_xstrdup(v);
+            continue;
+        }
         struct curl_slist *nl = curl_slist_append(l, headers[i]);
         if (!nl) { curl_slist_free_all(l); *ok = 0; return NULL; }
         l = nl;
@@ -68,8 +138,10 @@ static int http_do(const char *url, const char *post_fields,
 
     membuf m = {NULL, 0, 0};
     int hl_ok = 1;
-    struct curl_slist *hl = build_list(headers, &hl_ok);
-    if (!hl_ok) { curl_easy_cleanup(c); return DLM_ERR_NOMEM; }
+    char *cookie = NULL;
+    struct curl_slist *hl = build_list(headers, &hl_ok, &cookie);
+    if (!hl_ok) { curl_easy_cleanup(c); free(cookie); return DLM_ERR_NOMEM; }
+    if (cookie) { dlm_curl_set_scoped_cookie(c, url, cookie); free(cookie); }
 
     curl_easy_setopt(c, CURLOPT_URL, url);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);

@@ -21,4 +21,13 @@ int dlm_http_get(const char *url, const char *const *headers, char **body,
 int dlm_http_get_blob(const char *url, const char *const *headers, char **body,
                       size_t *len, long *status);
 
+/* case-insensitive prefix test (returns 1 if `s` starts with `p`) */
+int dlm_ci_prefix(const char *s, const char *p);
+
+/* Attach a session cookie to a curl easy handle via the cookie engine, scoped to
+ * the URL host's domain and marked Secure (see httpget.c). `handle` is a CURL*.
+ * Use this instead of a raw "Cookie:" header so the secret can't leak across a
+ * cross-site or http redirect. */
+void dlm_curl_set_scoped_cookie(void *handle, const char *url, const char *cookie_value);
+
 #endif /* DLM_HTTPGET_H */

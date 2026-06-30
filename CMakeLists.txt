@@ -104,6 +104,11 @@ target_link_libraries(dlm PUBLIC
   ${SQLITE3_LIBRARIES} ${PCRE2_LIBRARIES} ${CRYPTO_LIBRARIES}
   Threads::Threads)
 
+# 64-bit off_t on 32-bit POSIX so pwrite/ftruncate handle >2GB files correctly.
+if(NOT WIN32)
+  target_compile_definitions(dlm PUBLIC _FILE_OFFSET_BITS=64)
+endif()
+
 if(WIN32)
   # Win10+ for AF_UNIX sockets + WSAPoll; link Winsock and shell helpers.
   # __USE_MINGW_ANSI_STDIO makes printf honour C99 %zu/%lld (MSVCRT does not).

@@ -233,15 +233,25 @@ static void on_menu_shown(GtkWidget *pop, gpointer user)
     (void)pop;
     ((App *)user)->open_menus++;
 }
+/* Run the deferred rebuild from an idle, not inside the popover's "closed"
+ * emission — rebuilding there tears down the very popover (and the button whose
+ * handler is still on the stack) mid-signal, which is fragile/re-entrant. */
+static gboolean rebuild_idle(gpointer user)
+{
+    App *a = user;
+    if (a->open_menus == 0 && a->pending_rebuild) {
+        a->pending_rebuild = 0;
+        rebuild_list(a);
+    }
+    return G_SOURCE_REMOVE;
+}
 static void on_menu_closed(GtkPopover *pop, gpointer user)
 {
     (void)pop;
     App *a = user;
     if (a->open_menus > 0) a->open_menus--;
-    if (a->open_menus == 0 && a->pending_rebuild) {
-        a->pending_rebuild = 0;
-        rebuild_list(a);
-    }
+    if (a->open_menus == 0 && a->pending_rebuild)
+        g_idle_add(rebuild_idle, a);
 }
 
 static GtkWidget *menu_button(GtkWidget **box_out, GtkPopover **pop_out)

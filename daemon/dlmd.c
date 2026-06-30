@@ -54,6 +54,7 @@ static void trigger_tools_check(void)
  * or hostile client can't drive unbounded memory growth in the daemon. */
 #define MAX_CLIENT_INBUF (1 << 20)  /* 1 MiB per request line */
 #define MAX_CLIENT_OUTBUF (8 << 20) /* 8 MiB of unflushed responses/events */
+#define DLMD_MAX_CLIENTS 128        /* refuse past this so a flood can't exhaust fds */
 
 typedef struct {
     int fd;
@@ -259,6 +260,11 @@ int main(int argc, char **argv)
             for (;;) {
                 dlm_sock_t cfd = dlm_sock_accept(lfd);
                 if (cfd == DLM_INVALID_SOCK) break;
+                /* Refuse past a sane cap, but still accept+close so the backlog
+                 * drains — otherwise a local flood would keep lfd readable and
+                 * spin the poll loop, and unbounded clients_add could exhaust
+                 * fds. Closing here keeps us well under the OS fd limit. */
+                if (clients.n >= DLMD_MAX_CLIENTS) { dlm_sock_close(cfd); continue; }
                 dlm_sock_set_nonblock(cfd);
                 if (!clients_add(&clients, (int)cfd)) dlm_sock_close(cfd); /* OOM: drop */
             }

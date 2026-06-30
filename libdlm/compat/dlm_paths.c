@@ -127,9 +127,10 @@ int dlm_mkdir_mode(const char *path, int mode)
 #else
     if (mkdir(path, (mode_t)mode) == 0) return 0;
 #endif
-    /* treat an existing directory as success */
+    /* treat an existing *directory* as success — but a plain file sitting where
+     * a directory should be is a real failure, not "already exists". */
     struct stat st;
-    if (stat(path, &st) == 0) return 0;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) return 0;
     return -1;
 }
 

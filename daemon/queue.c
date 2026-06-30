@@ -266,7 +266,10 @@ static const char *merge_ext(const char *path)
 static void parse_progress_line(qitem *it, char *line)
 {
     if (strncmp(line, "dlmprog|", 8) != 0) return;
-    char fdl[32], ftot[32], fest[32], fsp[64];
+    /* default to "NA" so a short/truncated line (fewer than 4 matched fields,
+     * e.g. the overlong-line flush path) leaves the unmatched fields as
+     * "unknown" instead of reading indeterminate stack. */
+    char fdl[32] = "NA", ftot[32] = "NA", fest[32] = "NA", fsp[64] = "NA";
     if (sscanf(line + 8, "%31[^|]|%31[^|]|%31[^|]|%63[^\r\n]", fdl, ftot, fest,
                fsp) < 1)
         return;
@@ -596,7 +599,7 @@ int64_t dlm_queue_grab(dlm_queue *q, const char *package_name,
         row.out_path = opath;
         row.connections = l->connections;
         row.delegate = l->delegate;
-        row.total = l->size;
+        row.total = l->size ? l->size : -1; /* match in-memory "unknown" == -1 */
         row.enabled = 1;
         row.autostart = 1;
         row.list = "linkgrabber";

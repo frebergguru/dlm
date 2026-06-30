@@ -79,7 +79,9 @@ void dlm_sleep_ms(unsigned ms)
 int dlm_self_dir(char *buf, size_t n)
 {
     ssize_t r = readlink("/proc/self/exe", buf, n - 1);
-    if (r <= 0) return -1;
+    /* readlink truncates silently (returns the filled count, no error) when the
+     * target exceeds the buffer; reject that so we never build a bogus path. */
+    if (r <= 0 || (size_t)r >= n - 1) return -1;
     buf[r] = '\0';
     char *slash = strrchr(buf, '/');
     if (slash) *slash = '\0';

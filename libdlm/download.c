@@ -18,6 +18,7 @@
 #endif
 #include "dlm/dlm.h"
 #include "internal.h"
+#include "httpget.h"
 #include "compat/compat.h"
 
 #include <ctype.h>
@@ -66,6 +67,7 @@ typedef struct dlm_download_s {
     char *journal_path;
 
     struct curl_slist *header_list;
+    char *cookie;    /* IA session cookie, applied via the scoped cookie engine */
 
     int64_t total;   /* -1 unknown */
     int resumable;
@@ -145,6 +147,8 @@ static void apply_common_opts(CURL *c, dlm_download_t *dl)
     curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
     if (dl->header_list)
         curl_easy_setopt(c, CURLOPT_HTTPHEADER, dl->header_list);
+    if (dl->cookie)
+        dlm_curl_set_scoped_cookie(c, dl->url, dl->cookie);
 }
 
 /* Probe size + range support. Sets dl->total and dl->resumable. */
@@ -525,12 +529,24 @@ cleanup:
 
 /* ---- public entrypoint ------------------------------------------------ */
 
-static struct curl_slist *build_header_list(const char *const *headers)
+static struct curl_slist *build_header_list(const char *const *headers,
+                                            char **cookie_out)
 {
+    if (cookie_out) *cookie_out = NULL;
     struct curl_slist *list = NULL;
     if (!headers) return NULL;
-    for (int i = 0; headers[i]; i++)
+    for (int i = 0; headers[i]; i++) {
+        /* a "Cookie:" header is routed through the scoped cookie engine instead
+         * of being sent raw, so it can't follow a redirect off-site or to http */
+        if (cookie_out && dlm_ci_prefix(headers[i], "Cookie:")) {
+            const char *v = headers[i] + 7;
+            while (*v == ' ') v++;
+            free(*cookie_out);
+            *cookie_out = dlm_xstrdup(v);
+            continue;
+        }
         list = curl_slist_append(list, headers[i]);
+    }
     return list;
 }
 
@@ -604,7 +620,7 @@ dlm_result dlm_download_file(const dlm_options *opt)
     dl.cancel = opt->cancel;
     dl.on_progress = opt->on_progress;
     dl.userdata = opt->userdata;
-    dl.header_list = build_header_list(opt->headers);
+    dl.header_list = build_header_list(opt->headers, &dl.cookie);
 
     int connections = opt->connections > 0 ? opt->connections : DLM_DEFAULT_CONNS;
     int64_t min_split = opt->min_split_size > 0 ? opt->min_split_size
@@ -667,6 +683,7 @@ dlm_result dlm_download_file(const dlm_options *opt)
 done:
     if (dl.fd >= 0) close(dl.fd);
     if (dl.header_list) curl_slist_free_all(dl.header_list);
+    free(dl.cookie);
     free(dl.segs);
     free(dl.url);
     free(dl.out_path);
