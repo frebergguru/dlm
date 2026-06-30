@@ -84,7 +84,8 @@ static const char *SCHEMA =
     "  priority INTEGER NOT NULL DEFAULT 0,"
     "  collapsed INTEGER NOT NULL DEFAULT 0,"
     "  position INTEGER NOT NULL DEFAULT 0,"
-    "  created_at INTEGER NOT NULL DEFAULT 0"
+    "  created_at INTEGER NOT NULL DEFAULT 0,"
+    "  source_url TEXT"
     ");";
 
 /* Indexes for the columns the queue filters/orders by. Run *after* MIGRATIONS
@@ -109,6 +110,7 @@ static const char *MIGRATIONS[] = {
     "ALTER TABLE downloads ADD COLUMN position INTEGER NOT NULL DEFAULT 0;",
     "ALTER TABLE downloads ADD COLUMN force INTEGER NOT NULL DEFAULT 0;",
     "ALTER TABLE downloads ADD COLUMN autostart INTEGER NOT NULL DEFAULT 1;",
+    "ALTER TABLE packages ADD COLUMN source_url TEXT;",
     NULL,
 };
 
@@ -361,11 +363,12 @@ int dlm_store_load_all(dlm_store *s, dlm_store_row_cb cb, void *userdata)
 
 int64_t dlm_store_pkg_add(dlm_store *s, const char *name, const char *folder,
                           const char *comment, const char *list, int priority,
-                          int64_t position, int64_t created_at)
+                          int64_t position, int64_t created_at,
+                          const char *source_url)
 {
     const char *sql =
         "INSERT INTO packages(name,folder,comment,list,priority,position,"
-        "created_at) VALUES(?,?,?,?,?,?,?);";
+        "created_at,source_url) VALUES(?,?,?,?,?,?,?,?);";
     sqlite3_stmt *st = prep(s, sql);
     if (!st) return -1;
     sqlite3_bind_text(st, 1, name ? name : "", -1, SQLITE_TRANSIENT);
@@ -377,6 +380,8 @@ int64_t dlm_store_pkg_add(dlm_store *s, const char *name, const char *folder,
     sqlite3_bind_int(st, 5, priority);
     sqlite3_bind_int64(st, 6, position);
     sqlite3_bind_int64(st, 7, created_at);
+    if (source_url) sqlite3_bind_text(st, 8, source_url, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(st, 8);
     int rc = sqlite3_step(st);
     sqlite3_reset(st);
     if (rc != SQLITE_DONE) {
@@ -446,7 +451,7 @@ int dlm_store_pkg_load_all(dlm_store *s, dlm_store_pkg_cb cb, void *userdata)
 {
     const char *sql =
         "SELECT id,name,folder,comment,list,priority,collapsed,position,"
-        "created_at FROM packages ORDER BY position,id;";
+        "created_at,source_url FROM packages ORDER BY position,id;";
     sqlite3_stmt *st = prep(s, sql);
     if (!st) return -1;
     while (sqlite3_step(st) == SQLITE_ROW) {
@@ -460,6 +465,7 @@ int dlm_store_pkg_load_all(dlm_store *s, dlm_store_pkg_cb cb, void *userdata)
         row.collapsed = sqlite3_column_int(st, 6);
         row.position = sqlite3_column_int64(st, 7);
         row.created_at = sqlite3_column_int64(st, 8);
+        row.source_url = (const char *)sqlite3_column_text(st, 9);
         cb(userdata, &row);
     }
     sqlite3_reset(st);

@@ -94,12 +94,24 @@ int main(void)
         {"http://x/b.bin", "/d/b.bin", "b.bin", 200, 4, 0, "online"},
         {"http://x/c.bin", "/d/c.bin", "c.bin", -1, 4, 0, "unknown"},
     };
-    int64_t pkgid = dlm_queue_grab(q, "myitem", "/d", links, 3);
+    int64_t pkgid = dlm_queue_grab(q, "myitem", "/d", "http://x/item", links, 3);
     CHECK(pkgid > 0, "grab returns package id");
     CHECK(link_count(q) == 3, "three links staged");
     CHECK(count_in_list(q, DLM_LIST_LINKGRABBER) == 3, "all in linkgrabber");
     CHECK(count_in_list(q, DLM_LIST_DOWNLOAD) == 0, "none in download list");
     CHECK(pkg_count(q, DLM_LIST_LINKGRABBER) == 1, "one linkgrabber package");
+
+    /* the package remembers the source URL the user added (for host/favicon) */
+    {
+        dlm_psnap *ps = NULL; int np = 0;
+        dlm_queue_packages(q, &ps, &np);
+        int found = 0;
+        for (int i = 0; i < np; i++)
+            if (ps[i].id == pkgid && ps[i].source_url &&
+                !strcmp(ps[i].source_url, "http://x/item")) found = 1;
+        CHECK(found, "package retains source_url");
+        dlm_queue_packages_free(ps, np);
+    }
 
     /* linkgrabber links never auto-start, even with capacity */
     dlm_queue_set_max_active(q, 4);

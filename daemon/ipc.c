@@ -90,6 +90,8 @@ static json_t *pkg_array(dlm_queue *q)
             json_object_set_new(o, "folder", json_string(snap[i].folder));
         if (snap[i].comment)
             json_object_set_new(o, "comment", json_string(snap[i].comment));
+        if (snap[i].source_url)
+            json_object_set_new(o, "source_url", json_string(snap[i].source_url));
         json_object_set_new(o, "list", json_string(dlm_list_str(snap[i].list)));
         json_object_set_new(o, "priority", json_integer(snap[i].priority));
         json_object_set_new(o, "collapsed", json_boolean(snap[i].collapsed));
@@ -212,12 +214,14 @@ char *dlm_ipc_handle(dlm_queue *q, const char *line, int *want_subscribe,
     } else if (!strcmp(cmd, "grab")) {
         const char *name = json_string_value(json_object_get(req, "name"));
         const char *folder = json_string_value(json_object_get(req, "folder"));
+        const char *source_url =
+            json_string_value(json_object_get(req, "source_url"));
         dlm_grab_link *links = NULL;
         int n = parse_grab_links(json_object_get(req, "links"), &links);
         if (n < 0) {
             out = err_resp("grab: missing/empty links");
         } else {
-            int64_t pkg = dlm_queue_grab(q, name, folder, links, n);
+            int64_t pkg = dlm_queue_grab(q, name, folder, source_url, links, n);
             free(links);
             if (pkg < 0) out = err_resp("grab: failed");
             else {

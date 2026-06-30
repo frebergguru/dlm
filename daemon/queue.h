@@ -77,6 +77,7 @@ typedef struct {
     char *name;
     char *folder;
     char *comment;
+    char *source_url;   /* URL the user added (host/favicon source), may be NULL */
     dlm_list list;
     int priority;
     int collapsed;
@@ -108,8 +109,8 @@ int64_t dlm_queue_add(dlm_queue *q, const char *url, const char *out_path,
  * new package id (>0) or -1. Links are added disabled-for-scheduling by virtue
  * of living in the linkgrabber list; nothing runs until confirmed. */
 int64_t dlm_queue_grab(dlm_queue *q, const char *package_name,
-                       const char *folder, const dlm_grab_link *links,
-                       int count);
+                       const char *folder, const char *source_url,
+                       const dlm_grab_link *links, int count);
 
 /* Move linkgrabber content into the download list (queued). is_package selects
  * whether id is a package (all its links move) or a single link. id<=0 confirms

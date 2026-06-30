@@ -56,6 +56,7 @@ typedef struct {
     char *name;
     char *folder;
     char *comment;
+    char *source_url;      /* URL the user added (host/favicon source), or NULL */
     dlm_list list;
     int priority;
     int collapsed;
@@ -134,6 +135,7 @@ static void pkg_free(pkg *p)
     free(p->name);
     free(p->folder);
     free(p->comment);
+    free(p->source_url);
     free(p);
 }
 
@@ -412,6 +414,7 @@ static void load_pkg(void *ud, const dlm_store_pkg_row *row)
     p->name = xstrdup(row->name);
     p->folder = xstrdup(row->folder);
     p->comment = xstrdup(row->comment);
+    p->source_url = xstrdup(row->source_url);
     p->list = dlm_list_from_str(row->list);
     p->priority = row->priority;
     p->collapsed = row->collapsed;
@@ -550,8 +553,8 @@ int64_t dlm_queue_add(dlm_queue *q, const char *url, const char *out_path,
 }
 
 int64_t dlm_queue_grab(dlm_queue *q, const char *package_name,
-                       const char *folder, const dlm_grab_link *links,
-                       int count)
+                       const char *folder, const char *source_url,
+                       const dlm_grab_link *links, int count)
 {
     if (!links || count <= 0) return -1;
     pthread_mutex_lock(&q->mu);
@@ -564,7 +567,8 @@ int64_t dlm_queue_grab(dlm_queue *q, const char *package_name,
     int64_t pkg_id = dlm_store_pkg_add(q->store,
                                        package_name ? package_name : "links",
                                        folder, NULL, "linkgrabber",
-                                       DLM_PRIO_DEFAULT, pos, time(NULL));
+                                       DLM_PRIO_DEFAULT, pos, time(NULL),
+                                       source_url);
     if (pkg_id <= 0) {
         dlm_store_rollback(q->store);
         pthread_mutex_unlock(&q->mu);
@@ -574,6 +578,7 @@ int64_t dlm_queue_grab(dlm_queue *q, const char *package_name,
     p->id = pkg_id;
     p->name = xstrdup(package_name ? package_name : "links");
     p->folder = xstrdup(folder);
+    p->source_url = xstrdup(source_url);
     p->list = DLM_LIST_LINKGRABBER;
     p->priority = DLM_PRIO_DEFAULT;
     p->position = pos;
@@ -1301,6 +1306,7 @@ int dlm_queue_packages(dlm_queue *q, dlm_psnap **out, int *count)
         arr[i].name = xstrdup(p->name);
         arr[i].folder = xstrdup(p->folder);
         arr[i].comment = xstrdup(p->comment);
+        arr[i].source_url = xstrdup(p->source_url);
         arr[i].list = p->list;
         arr[i].priority = p->priority;
         arr[i].collapsed = p->collapsed;
@@ -1336,6 +1342,7 @@ void dlm_queue_packages_free(dlm_psnap *snap, int count)
         free(snap[i].name);
         free(snap[i].folder);
         free(snap[i].comment);
+        free(snap[i].source_url);
     }
     free(snap);
 }

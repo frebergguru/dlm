@@ -57,6 +57,7 @@ typedef struct {
     int collapsed;        /* UI hint: 1 => collapsed in the view */
     int64_t position;
     int64_t created_at;
+    const char *source_url; /* URL the user added (for host/favicon), may be NULL */
 } dlm_store_pkg_row;
 
 typedef void (*dlm_store_row_cb)(void *userdata, const dlm_store_row *row);
@@ -109,10 +110,12 @@ int dlm_store_load_all(dlm_store *s, dlm_store_row_cb cb, void *userdata);
 
 /* ---- packages --------------------------------------------------------- */
 
-/* Insert a new package; returns its id (>0) or -1. */
+/* Insert a new package; returns its id (>0) or -1. source_url (the URL the user
+ * added) may be NULL. */
 int64_t dlm_store_pkg_add(dlm_store *s, const char *name, const char *folder,
                           const char *comment, const char *list, int priority,
-                          int64_t position, int64_t created_at);
+                          int64_t position, int64_t created_at,
+                          const char *source_url);
 
 /* Update a package's mutable metadata. NULL string args leave that field. */
 int dlm_store_pkg_update(dlm_store *s, int64_t id, const char *name,

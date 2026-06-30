@@ -863,6 +863,8 @@ static int cmd_grab(int argc, char **argv)
     json_t *req = req_obj("grab");
     json_object_set_new(req, "name", json_string(pkgname));
     json_object_set_new(req, "folder", json_string(dest));
+    /* the URL the user added: the GUI groups + draws favicons by its host */
+    json_object_set_new(req, "source_url", json_string(url));
     json_t *links = json_array();
     for (int i = 0; i < res.count; i++) {
         dlm_task *t = &res.tasks[i];
