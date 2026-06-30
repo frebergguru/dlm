@@ -33,6 +33,7 @@ void dlm_extract_result_free(dlm_extract_result *r)
     }
     free(r->tasks);
     free(r->source);
+    free(r->title);
     memset(r, 0, sizeof *r);
 }
 

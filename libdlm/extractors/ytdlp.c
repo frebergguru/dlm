@@ -139,6 +139,10 @@ int dlm_ytdlp_parse(const char *json_text, const char *input_url,
     }
 
     out->source = dlm_xstrdup("yt-dlp");
+    /* root title: playlist title for a playlist, video title for a single item;
+     * names the package / save subfolder. */
+    const char *yt_title = json_string_value(json_object_get(root, "title"));
+    if (yt_title && *yt_title) out->title = dlm_xstrdup(yt_title);
     json_t *entries = json_object_get(root, "entries");
     if (json_is_array(entries) && json_array_size(entries) > 0) {
         size_t n = json_array_size(entries);

@@ -31,6 +31,8 @@ typedef struct {
     dlm_task *tasks;
     int count;
     char *source;     /* extractor name that produced these ("archive.org", ...) */
+    char *title;      /* human title of the item (archive.org metadata title /
+                       * yt-dlp title), used to name the package, or NULL */
 } dlm_extract_result;
 
 /* Extract a URL into download tasks. Returns DLM_OK and fills `out` (which the

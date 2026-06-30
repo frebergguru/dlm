@@ -29,9 +29,9 @@ static const char *MERGE =
     "{\"title\":\"HD\",\"ext\":\"mkv\",\"webpage_url\":\"https://site/v\","
     "\"requested_formats\":[{\"url\":\"https://cdn/v\"},{\"url\":\"https://cdn/a\"}]}";
 
-/* playlist with two entries */
+/* playlist with two entries (and a playlist title) */
 static const char *PLAYLIST =
-    "{\"entries\":["
+    "{\"title\":\"My Playlist\",\"entries\":["
     "{\"title\":\"A\",\"ext\":\"mp4\",\"protocol\":\"https\",\"url\":\"https://c/a.mp4\"},"
     "{\"title\":\"B\",\"ext\":\"webm\",\"protocol\":\"m3u8\",\"url\":\"https://c/b.m3u8\",\"webpage_url\":\"https://s/b\"}"
     "]}";
@@ -69,6 +69,7 @@ int main(void)
     /* playlist -> 2 tasks, mixed */
     CHECK(dlm_ytdlp_parse(PLAYLIST, "https://s", &r) == 0, "parse playlist");
     CHECK(r.count == 2, "two entries");
+    CHECK(r.title && strcmp(r.title, "My Playlist") == 0, "playlist title parsed");
     CHECK(r.tasks[0].delegate == 0, "entry A progressive");
     CHECK(r.tasks[1].delegate == 1, "entry B hls delegated");
     dlm_extract_result_free(&r);

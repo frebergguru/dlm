@@ -216,6 +216,11 @@ int dlm_extract_archiveorg(const char *url, dlm_extract_result *out)
     out->count = 0;
     out->source = dlm_xstrdup("archive.org");
 
+    /* item title (from the metadata block) names the package / save subfolder */
+    json_t *meta = json_object_get(root, "metadata");
+    const char *meta_title = meta ? json_string_value(json_object_get(meta, "title")) : NULL;
+    if (meta_title && *meta_title) out->title = dlm_xstrdup(meta_title);
+
     size_t idx;
     json_t *f;
     json_array_foreach(files, idx, f) {
