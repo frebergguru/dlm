@@ -215,8 +215,12 @@ static int run_capture(const char *const argv[], char **out, int *exit_code)
 int dlm_extract_ytdlp(const char *url, dlm_extract_result *out)
 {
     dlm_tools_ensure_ready(1); /* fetch yt-dlp on first use if missing */
+    /* No --no-playlist here: a playlist/season URL expands to one info dict per
+     * entry (dlm_ytdlp_parse walks "entries"), so the whole set is staged as a
+     * package. --no-playlist is kept on the per-episode download (queue.c) so a
+     * single confirmed link fetches just that video. */
     const char *argv[] = {dlm_tool_path("yt-dlp"), "-J", "--no-warnings",
-                          "--no-playlist", "--", url, NULL};
+                          "--", url, NULL};
     char *json = NULL;
     int ec = 0;
     if (run_capture(argv, &json, &ec) != 0) {
