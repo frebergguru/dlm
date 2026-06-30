@@ -548,14 +548,16 @@ static GtkWidget *make_site_header(App *a, const char *host, int count,
 }
 
 /* One download/linkgrabber link row, with all per-link queue actions. */
-static GtkWidget *make_row(Dl *d, int linkgrabber)
+/* `indent` adds an extra left inset (site+packages mode nests a package's files
+ * under its site header); 0 elsewhere. */
+static GtkWidget *make_row(Dl *d, int linkgrabber, int indent)
 {
     GtkWidget *row = gtk_list_box_row_new();
     gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
     GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
     gtk_widget_set_margin_top(outer, 8);
     gtk_widget_set_margin_bottom(outer, 8);
-    gtk_widget_set_margin_start(outer, linkgrabber ? 12 : 24); /* indent under pkg */
+    gtk_widget_set_margin_start(outer, (linkgrabber ? 12 : 24) + indent); /* indent under pkg */
     gtk_widget_set_margin_end(outer, 12);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
@@ -667,7 +669,9 @@ static GtkWidget *make_row(Dl *d, int linkgrabber)
 }
 
 /* A package header row with collapse + package-wide actions. */
-static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber)
+/* `indent` insets the whole package header (site+packages mode nests packages
+ * under their site header); 0 elsewhere. */
+static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber, int indent)
 {
     (void)a;
     GtkWidget *row = gtk_list_box_row_new();
@@ -675,7 +679,7 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber)
     GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_margin_top(outer, 6);
     gtk_widget_set_margin_bottom(outer, 6);
-    gtk_widget_set_margin_start(outer, 8);
+    gtk_widget_set_margin_start(outer, 8 + indent);
     gtk_widget_set_margin_end(outer, 12);
     gtk_widget_add_css_class(outer, "toolbar");
 
@@ -808,6 +812,9 @@ static void item_host(App *a, Dl *d, char *buf, size_t len)
     host_of(d->url, buf, len);
 }
 
+/* One indent step (px) for nesting a package under its site header. */
+#define SITE_INDENT 24
+
 /* Classic package grouping (used for the downloads view and "Packages" mode). */
 static int render_pkg_view(App *a, GtkListBox *list, const char *view,
                            const char *filter, int linkgrabber)
@@ -817,14 +824,14 @@ static int render_pkg_view(App *a, GtkListBox *list, const char *view,
     for (int pi = 0; pi < a->npkg; pi++) {
         Pkg *p = &a->pkgs[pi];
         if (!p->list || strcmp(p->list, view)) continue;
-        gtk_list_box_append(list, make_pkg_header(a, p, linkgrabber));
+        gtk_list_box_append(list, make_pkg_header(a, p, linkgrabber, 0));
         shown++;
         if (p->collapsed) continue;
         for (int i = 0; i < a->n; i++) {
             Dl *d = &a->items[i];
             if (d->package_id != p->id || !d->list || strcmp(d->list, view)) continue;
             if (!linkgrabber && filter && (!d->state || strcmp(d->state, filter))) continue;
-            gtk_list_box_append(list, make_row(d, linkgrabber));
+            gtk_list_box_append(list, make_row(d, linkgrabber, 0));
         }
     }
     /* loose links (no package in this view) */
@@ -833,7 +840,7 @@ static int render_pkg_view(App *a, GtkListBox *list, const char *view,
         if (!d->list || strcmp(d->list, view)) continue;
         if (item_has_pkg(a, d, view)) continue;
         if (!linkgrabber && filter && (!d->state || strcmp(d->state, filter))) continue;
-        gtk_list_box_append(list, make_row(d, linkgrabber));
+        gtk_list_box_append(list, make_row(d, linkgrabber, 0));
         shown++;
     }
     return shown;
@@ -886,17 +893,18 @@ static int render_site_view(App *a, GtkListBox *list, const char *view,
                 if (!p->list || strcmp(p->list, view)) continue;
                 char ph[256]; pkg_host(a, p, view, ph, sizeof ph);
                 if (strcmp(ph, host)) continue;
-                gtk_list_box_append(list, make_pkg_header(a, p, linkgrabber));
+                /* nest the package (header + its files) under its site header */
+                gtk_list_box_append(list, make_pkg_header(a, p, linkgrabber, SITE_INDENT));
                 if (p->collapsed) continue;
                 for (int i = 0; i < a->n; i++) {
                     Dl *d = &a->items[i];
                     if (d->package_id != p->id || !d->list || strcmp(d->list, view))
                         continue;
                     if (!item_passes(d, filter, linkgrabber)) continue;
-                    gtk_list_box_append(list, make_row(d, linkgrabber));
+                    gtk_list_box_append(list, make_row(d, linkgrabber, SITE_INDENT));
                 }
             }
-            /* loose links of this host (no package) */
+            /* loose links of this host (no package): stay at the site level */
             for (int i = 0; i < a->n; i++) {
                 Dl *d = &a->items[i];
                 if (!d->list || strcmp(d->list, view)) continue;
@@ -904,7 +912,7 @@ static int render_site_view(App *a, GtkListBox *list, const char *view,
                 if (!item_passes(d, filter, linkgrabber)) continue;
                 char h[256]; item_host(a, d, h, sizeof h);
                 if (strcmp(h, host)) continue;
-                gtk_list_box_append(list, make_row(d, linkgrabber));
+                gtk_list_box_append(list, make_row(d, linkgrabber, 0));
             }
         } else {
             /* all links of this host, regardless of package */
@@ -914,7 +922,7 @@ static int render_site_view(App *a, GtkListBox *list, const char *view,
                 if (!item_passes(d, filter, linkgrabber)) continue;
                 char h[256]; item_host(a, d, h, sizeof h);
                 if (strcmp(h, host)) continue;
-                gtk_list_box_append(list, make_row(d, linkgrabber));
+                gtk_list_box_append(list, make_row(d, linkgrabber, 0));
             }
         }
     }
