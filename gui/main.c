@@ -16,6 +16,7 @@
 
 #include <adwaita.h>
 #include <errno.h>
+#include <limits.h>
 #include <jansson.h>
 #include <string.h>
 
@@ -38,6 +39,9 @@ static guint dlm_gui_add_socket_watch(int fd, GIOCondition cond, GIOFunc fn, gpo
 /* libdlm/httpget.c — declared here to avoid pulling in the private header. */
 int dlm_http_get_blob(const char *url, const char *const *headers, char **body,
                       size_t *len, long *status);
+int dlm_http_get(const char *url, const char *const *headers, char **body,
+                 long *status);
+int dlm_ci_prefix(const char *s, const char *p);
 
 /* How the linkgrabber groups links. */
 enum { GROUP_SITE_PKG = 0, GROUP_SITE, GROUP_PKG };
@@ -368,25 +372,130 @@ static char *favicon_cache_path(const char *host)
     return path;
 }
 
-/* Worker thread: fetch https://host/favicon.ico into the cache file. */
+/* Fetch `url` and, if it is a real image, store it as the cached favicon for
+ * `host`. Validating the bytes (not just the 200) lets us fall through to the
+ * HTML <link rel="icon"> when a site answers /favicon.ico with a soft-404
+ * HTML page. */
+static gboolean favicon_save(const char *url, const char *host)
+{
+    char *body = NULL; size_t len = 0; long st = 0;
+    gboolean ok = FALSE;
+    if (dlm_http_get_blob(url, NULL, &body, &len, &st) == 0 &&
+        st >= 200 && st < 300 && len > 0) {
+        GInputStream *mem = g_memory_input_stream_new_from_data(body, len, NULL);
+        GdkPixbuf *pb = gdk_pixbuf_new_from_stream(mem, NULL, NULL);
+        g_object_unref(mem);
+        if (pb) {
+            g_object_unref(pb);
+            char *path = favicon_cache_path(host);
+            char *dir = g_path_get_dirname(path);
+            g_mkdir_with_parents(dir, 0700);
+            ok = g_file_set_contents(path, body, (gssize)len, NULL);
+            g_free(dir);
+            g_free(path);
+        }
+    }
+    g_free(body);
+    return ok;
+}
+
+/* Largest pixel dimension named in a sizes="..." attribute within [p, end).
+ * "any" (a scalable SVG) wins outright; 0 when absent/unparseable. */
+static int favicon_sizes_score(const char *p, const char *end)
+{
+    const char *sz = g_strstr_len(p, end - p, "sizes");
+    if (!sz) return 0;
+    const char *q = sz + 5;
+    while (q < end && (*q == ' ' || *q == '\t' || *q == '=')) q++;
+    char quote = 0;
+    if (q < end && (*q == '"' || *q == '\'')) { quote = *q; q++; }
+    const char *v = q;
+    while (q < end && *q != quote &&
+           (quote || (*q != ' ' && *q != '\t' && *q != '>'))) q++;
+    if (g_strstr_len(v, q - v, "any")) return INT_MAX;
+    int best = 0, n = 0;                        /* "32x32" / "16x16 32x32" -> 32 */
+    for (const char *r = v; r < q; r++) {
+        if (*r >= '0' && *r <= '9') n = n * 10 + (*r - '0');
+        else { if (n > best) best = n; n = 0; }
+    }
+    return n > best ? n : best;
+}
+
+/* Pick the href of the largest declared <link rel="...icon..."> in an HTML
+ * document (by sizes=), preferring the first when none advertise a size.
+ * Returns the URL as written in the page (caller frees) or NULL. */
+static char *favicon_href_from_html(const char *html)
+{
+    char *low = g_ascii_strdown(html, -1);   /* same byte length: ASCII-only fold */
+    char *best = NULL;
+    int best_score = -1;
+    const char *p = low;
+    while ((p = strstr(p, "<link")) != NULL) {
+        const char *tag_end = strchr(p, '>');
+        if (!tag_end) break;
+        size_t span = (size_t)(tag_end - p);
+        const char *hrefkey = g_strstr_len(p, span, "href");
+        if (g_strstr_len(p, span, "rel") && g_strstr_len(p, span, "icon") && hrefkey) {
+            const char *q = hrefkey + 4;
+            while (q < tag_end && (*q == ' ' || *q == '\t' || *q == '=')) q++;
+            char quote = 0;
+            if (q < tag_end && (*q == '"' || *q == '\'')) { quote = *q; q++; }
+            const char *start = q;
+            while (q < tag_end && *q != quote &&
+                   (quote || (*q != ' ' && *q != '\t' && *q != '>'))) q++;
+            if (q > start) {
+                int score = favicon_sizes_score(p, tag_end);
+                if (score > best_score) {                    /* original case */
+                    g_free(best);
+                    best = g_strndup(html + (start - low), (size_t)(q - start));
+                    best_score = score;
+                }
+            }
+        }
+        p = tag_end;
+    }
+    g_free(low);
+    return best;
+}
+
+/* Resolve an icon href against https://host/ into an absolute http(s) URL. */
+static char *favicon_resolve_url(const char *host, const char *href)
+{
+    while (*href == ' ' || *href == '\t') href++;
+    if (dlm_ci_prefix(href, "http://") || dlm_ci_prefix(href, "https://"))
+        return g_strdup(href);
+    if (href[0] == '/' && href[1] == '/')           /* protocol-relative */
+        return g_strdup_printf("https:%s", href);
+    if (href[0] == '/')                             /* host-absolute path */
+        return g_strdup_printf("https://%s%s", host, href);
+    if (!*href)
+        return NULL;
+    return g_strdup_printf("https://%s/%s", host, href);   /* document-relative */
+}
+
+/* Worker thread: try /favicon.ico, then the page's <link rel="icon">. */
 static void favicon_worker(GTask *task, gpointer src, gpointer data, GCancellable *c)
 {
     (void)src; (void)c;
     const char *host = data;
     char url[512];
     snprintf(url, sizeof url, "https://%s/favicon.ico", host);
-    char *body = NULL; size_t len = 0; long st = 0;
-    gboolean ok = FALSE;
-    if (dlm_http_get_blob(url, NULL, &body, &len, &st) == 0 &&
-        st >= 200 && st < 300 && len > 0) {
-        char *path = favicon_cache_path(host);
-        char *dir = g_path_get_dirname(path);
-        g_mkdir_with_parents(dir, 0700);
-        ok = g_file_set_contents(path, body, (gssize)len, NULL);
-        g_free(dir);
-        g_free(path);
+    gboolean ok = favicon_save(url, host);
+
+    if (!ok) {
+        char page[512];
+        snprintf(page, sizeof page, "https://%s/", host);
+        char *html = NULL; long st = 0;
+        if (dlm_http_get(page, NULL, &html, &st) == 0 && st >= 200 && st < 300 && html) {
+            char *href = favicon_href_from_html(html);
+            if (href) {
+                char *iurl = favicon_resolve_url(host, href);
+                if (iurl) { ok = favicon_save(iurl, host); g_free(iurl); }
+                g_free(href);
+            }
+        }
+        g_free(html);
     }
-    g_free(body);
     g_task_return_boolean(task, ok);
 }
 
@@ -425,11 +534,11 @@ static void favicon_fetched(GObject *src, GAsyncResult *res, gpointer user)
     g_object_unref(img);
 }
 
-/* A 24px site icon: cached favicon if available, otherwise a generic globe
+/* A 24px site icon: cached favicon if available, otherwise a question mark
  * with a one-shot background fetch kicked off for next time. */
 static GtkWidget *make_site_icon(const char *host)
 {
-    GtkWidget *img = gtk_image_new_from_icon_name("emblem-web-symbolic");
+    GtkWidget *img = gtk_image_new_from_icon_name("dialog-question-symbolic");
     gtk_image_set_pixel_size(GTK_IMAGE(img), 24);
     if (!host || !*host) return img;
 
