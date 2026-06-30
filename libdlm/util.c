@@ -172,9 +172,14 @@ char *dlm_filename_from_url(const char *url)
         memcpy(out, name, namelen);
         out[namelen] = '\0';
         percent_decode(out);
-        /* sanitise path separators that may survive decoding */
+        /* sanitise separators / control chars that may survive decoding, and
+         * neutralise a leading '.'/'-' (so a name like ".." can't point at the
+         * parent dir and a leading '-' can't look like an option) — same policy
+         * as the extractors' sanitize_filename/basename_of. */
         for (char *c = out; *c; c++)
-            if (*c == '/' || *c == '\\') *c = '_';
+            if (*c == '/' || *c == '\\' || *c == ':' || (unsigned char)*c < 0x20)
+                *c = '_';
+        if (out[0] == '.' || out[0] == '-') out[0] = '_';
         if (out[0] == '\0') {
             free(out);
             out = dlm_xstrdup("download");

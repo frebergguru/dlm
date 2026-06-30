@@ -188,6 +188,13 @@ dlm_proc *dlm_proc_spawn(const char *const argv[], int capture)
             close(pfd[0]);
             close(pfd[1]);
         }
+        /* Close every inherited descriptor above stdio so the child (yt-dlp,
+         * ffmpeg, tar — third-party code) never receives the daemon's control
+         * socket, live client connections, sqlite db, or other downloads'
+         * .part fds. Cheap and robust regardless of per-fd CLOEXEC. */
+        long maxfd = sysconf(_SC_OPEN_MAX);
+        if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+        for (int fd = 3; fd < (int)maxfd; fd++) close(fd);
         execvp(argv[0], (char *const *)argv);
         _exit(127);
     }

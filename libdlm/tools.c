@@ -240,7 +240,7 @@ static int lock_acquire(void)
     tools_dir(dir, sizeof dir);
     dlm_mkdir_p(dir);
     snprintf(path, sizeof path, "%s/.lock", dir);
-    g_lock = open(path, O_CREAT | O_RDWR, 0644);
+    g_lock = open(path, O_CREAT | O_RDWR | DLM_O_CLOEXEC, 0644); /* don't leak to children */
     if (g_lock < 0) return -1;
     if (flock(g_lock, LOCK_EX) != 0) { close(g_lock); g_lock = -1; return -1; }
     return 0;

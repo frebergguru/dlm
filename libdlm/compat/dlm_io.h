@@ -18,6 +18,19 @@
 #  define DLM_O_BINARY 0
 #endif
 
+/* Close-on-exec and no-follow-symlink open() flags, or 0 where unavailable, so
+ * the same open() call is safe to write across platforms. */
+#ifdef O_CLOEXEC
+#  define DLM_O_CLOEXEC O_CLOEXEC
+#else
+#  define DLM_O_CLOEXEC 0
+#endif
+#ifdef O_NOFOLLOW
+#  define DLM_O_NOFOLLOW O_NOFOLLOW
+#else
+#  define DLM_O_NOFOLLOW 0
+#endif
+
 /* pwrite(2): write n bytes at absolute offset without moving the shared file
  * pointer (the engine uses one fd per download from a single worker thread, so
  * the Windows seek+write emulation is race-free). Returns bytes written or -1. */

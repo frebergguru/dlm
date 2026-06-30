@@ -124,6 +124,7 @@ int dlm_poll(struct dlm_pollfd *fds, unsigned n, int timeout_ms)
 #else /* POSIX */
 
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <poll.h>
 #include <fcntl.h>
@@ -147,10 +148,15 @@ dlm_sock_t dlm_unix_listen(const char *path, int backlog)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return DLM_INVALID_SOCK;
+    fcntl(fd, F_SETFD, FD_CLOEXEC); /* don't leak the control socket to children */
     struct sockaddr_un a;
     if (set_sun(&a, path) != 0) { close(fd); return DLM_INVALID_SOCK; }
     unlink(path); /* clear any stale socket */
     if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0) { close(fd); return DLM_INVALID_SOCK; }
+    /* owner-only: connecting to an AF_UNIX socket needs write perm on the file,
+     * so 0600 blocks any other local user from driving the daemon even if the
+     * socket landed in a world-traversable dir under a permissive umask. */
+    chmod(path, 0600);
     if (listen(fd, backlog) < 0) { close(fd); return DLM_INVALID_SOCK; }
     dlm_sock_set_nonblock(fd);
     return fd;
@@ -166,13 +172,18 @@ dlm_sock_t dlm_unix_connect(const char *path)
     return fd;
 }
 
-dlm_sock_t dlm_sock_accept(dlm_sock_t lfd) { return accept(lfd, NULL, NULL); }
-
 int dlm_sock_set_nonblock(dlm_sock_t fd)
 {
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl < 0) return -1;
     return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+dlm_sock_t dlm_sock_accept(dlm_sock_t lfd)
+{
+    int fd = accept(lfd, NULL, NULL);
+    if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC); /* keep client fds out of children */
+    return fd;
 }
 
 long dlm_sock_read(dlm_sock_t fd, void *buf, size_t n) { return read(fd, buf, n); }

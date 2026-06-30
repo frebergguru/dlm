@@ -146,6 +146,11 @@ static int http_do(const char *url, const char *post_fields,
     curl_easy_setopt(c, CURLOPT_URL, url);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 20L);
+    /* restrict to web protocols (no file://, scp, gopher, dict) on the request
+     * and on redirects — defends the metadata/API fetches against SSRF too */
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(c, CURLOPT_SSLVERSION, (long)CURL_SSLVERSION_TLSv1_2);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_USERAGENT, HTTPGET_UA);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 30L);

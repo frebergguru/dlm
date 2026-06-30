@@ -140,6 +140,12 @@ static void apply_common_opts(CURL *c, dlm_download_t *dl)
     curl_easy_setopt(c, CURLOPT_URL, dl->url);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 20L);
+    /* Lock the engine to web transfer protocols so an attacker-supplied URL or
+     * a 30x redirect can't reach file:// (local-file read), scp/gopher/dict
+     * (SSRF), etc. Applies to the initial request and every redirect hop. */
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https,ftp,ftps");
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "http,https,ftp,ftps");
+    curl_easy_setopt(c, CURLOPT_SSLVERSION, (long)CURL_SSLVERSION_TLSv1_2);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_USERAGENT, DLM_UA);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 30L);
@@ -585,7 +591,10 @@ static int64_t resume_extent(const dlm_download_t *dl)
 static dlm_result open_part_file(dlm_download_t *dl, int64_t need_extent, int *stale)
 {
     if (stale) *stale = 0;
-    dl->fd = open(dl->part_path, O_RDWR | O_CREAT | DLM_O_BINARY, 0644);
+    /* O_NOFOLLOW: refuse a symlink planted at <out>.dlmpart (a local attacker
+     * could otherwise redirect our ftruncate/pwrite onto a victim-owned file in
+     * a shared download dir). O_CLOEXEC: don't leak the fd to helper children. */
+    dl->fd = open(dl->part_path, O_RDWR | O_CREAT | DLM_O_CLOEXEC | DLM_O_NOFOLLOW | DLM_O_BINARY, 0644);
     if (dl->fd < 0) {
         DLM_ERROR("cannot open %s: %s", dl->part_path, strerror(errno));
         return DLM_ERR_IO;

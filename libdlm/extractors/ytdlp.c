@@ -51,6 +51,10 @@ static char **headers_from_json(json_t *hdrs)
     json_object_foreach(hdrs, key, val) {
         const char *v = json_string_value(val);
         if (!v) continue;
+        /* drop header name/value with embedded CR/LF (or controls): yt-dlp's
+         * http_headers is remote-influenced and must not be able to inject
+         * extra request headers via a smuggled newline. */
+        if (strpbrk(key, "\r\n") || strpbrk(v, "\r\n")) continue;
         size_t len = strlen(key) + strlen(v) + 3;
         char *line = dlm_xmalloc(len);
         snprintf(line, len, "%s: %s", key, v);

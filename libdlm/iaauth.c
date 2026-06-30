@@ -109,7 +109,7 @@ static int save_root(json_t *ia)
     /* Create the temp file 0600 up front: the secret must never touch the disk
      * with broader permissions, which json_dump_file would do (it fopen()s the
      * file 0644 & ~umask and only then would we chmod it). */
-    int fd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC | DLM_O_BINARY, 0600);
+    int fd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC | DLM_O_CLOEXEC | DLM_O_NOFOLLOW | DLM_O_BINARY, 0600);
     if (fd < 0) {
         DLM_ERROR("ia: cannot create %s: %s", tmp, strerror(errno));
         json_decref(root);
