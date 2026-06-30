@@ -1187,10 +1187,10 @@ typedef struct {
 } ResolveCtx;
 
 /* Enqueue each resolved task directly into the download list. */
-static void stage_add(ResolveCtx *r)
+static void stage_add(ResolveCtx *rc)
 {
-    const char *url = r->url, *dir = r->dir;
-    dlm_extract_result res = r->res;
+    const char *url = rc->url, *dir = rc->dir;
+    dlm_extract_result res = rc->res;
     /* lay files out under <dir>/<host>/[<title>/] */
     char *dest = build_dest_dir(dir, url, res.title, res.count > 1);
     g_mkdir_with_parents(dest, 0755);
