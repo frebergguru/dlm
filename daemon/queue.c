@@ -373,6 +373,7 @@ static void *worker_main(void *arg)
     ensure_parent_dir(it->out_path);
 
     dlm_result r;
+    long http_status = 0;
     if (it->delegate) {
         r = run_ytdlp(it, per);
     } else {
@@ -385,6 +386,7 @@ static void *worker_main(void *arg)
         opt.on_progress = progress_cb;
         opt.userdata = it;
         opt.cancel = &it->cancel;
+        opt.http_status = &http_status;
         r = dlm_download_file(&opt);
     }
 
@@ -399,7 +401,15 @@ static void *worker_main(void *arg)
     } else {
         it->state = Q_ERROR;
         free(it->error);
-        it->error = xstrdup(dlm_strerror(r));
+        /* report the actual HTTP status (404/403/500/...) instead of a generic
+         * "network error" so the user knows the server rejected the request. */
+        if (r == DLM_ERR_HTTP && http_status) {
+            char hb[64];
+            dlm_http_error_str(http_status, hb, sizeof hb);
+            it->error = xstrdup(hb);
+        } else {
+            it->error = xstrdup(dlm_strerror(r));
+        }
         it->speed_bps = 0;
     }
     it->finished = 1;

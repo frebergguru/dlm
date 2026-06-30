@@ -207,12 +207,20 @@ static int download_task(const dlm_task *t, const char *out_path, int conns,
     opt.on_progress = progress;
     opt.cancel = &g_cancel;
     opt.headers = (const char *const *)t->headers;
+    long http = 0;
+    opt.http_status = &http;
 
     fprintf(stderr, "dlm: %s -> %s\n", t->url, out_path);
     dlm_result r = dlm_download_file(&opt);
     fputc('\n', stderr);
     if (r != DLM_OK) {
-        fprintf(stderr, "dlm: failed: %s\n", dlm_strerror(r));
+        if (r == DLM_ERR_HTTP && http) {
+            char hb[64];
+            dlm_http_error_str(http, hb, sizeof hb);
+            fprintf(stderr, "dlm: failed: %s\n", hb);
+        } else {
+            fprintf(stderr, "dlm: failed: %s\n", dlm_strerror(r));
+        }
         return 1;
     }
     if (t->md5) {
@@ -638,6 +646,10 @@ static void print_link_row(json_t *o)
 
     printf("  %-4lld %-8s %6s %10s %10s %-3s %-3s %s\n", id, state ? state : "?",
            pct, size, speed > 1 ? spd : "-", prio_tag(prio), flags, name);
+    /* surface the failure reason so an errored row isn't a mystery */
+    const char *err = json_string_value(json_object_get(o, "error"));
+    if (state && !strcmp(state, "error") && err && *err)
+        printf("       \xE2\x86\xB3 %s\n", err); /* ↳ <reason> */
 }
 
 /* Render the downloads/packages of a response, grouped into packages, showing

@@ -58,6 +58,7 @@ typedef struct {
     char *list;            /* "download" | "linkgrabber" */
     char *availability;    /* "online" | "offline" | "unknown" */
     char *url;             /* source URL (for site grouping / favicon) */
+    char *error;           /* failure reason shown on an errored row */
 } Dl;
 
 typedef struct {
@@ -611,6 +612,10 @@ static GtkWidget *make_row(Dl *d, int linkgrabber, int indent)
         const char *av = d->availability ? d->availability : "unknown";
         snprintf(meta, sizeof meta, "%s · %s%s", av,
                  d->total > 0 ? tb : "size unknown", flags);
+    } else if (!strcmp(state, "error") && d->error && *d->error) {
+        /* show why it failed (e.g. "HTTP 404 (file not found)") rather than a
+         * bare "error" the user can't act on */
+        snprintf(meta, sizeof meta, "error · %s%s", d->error, flags);
     } else if (d->total > 0 && d->speed > 1 && d->downloaded < d->total) {
         long eta = (long)((double)(d->total - d->downloaded) / d->speed);
         snprintf(meta, sizeof meta, "%s · %s / %s · %s/s · ETA %ld:%02ld%s",
@@ -1012,6 +1017,7 @@ static void free_items(App *a)
         g_free(a->items[i].list);
         g_free(a->items[i].availability);
         g_free(a->items[i].url);
+        g_free(a->items[i].error);
     }
     free(a->items);
     a->items = NULL;
@@ -1082,6 +1088,7 @@ static void apply_downloads(App *a, json_t *arr)
         d->list = g_strdup(json_string_value(json_object_get(o, "list")));
         d->availability = g_strdup(json_string_value(json_object_get(o, "availability")));
         d->url = g_strdup(json_string_value(json_object_get(o, "url")));
+        d->error = g_strdup(json_string_value(json_object_get(o, "error")));
     }
 }
 

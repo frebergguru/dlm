@@ -78,6 +78,7 @@ typedef struct dlm_download_s {
     int64_t downloaded;
     int io_error;
     int range_ignored; /* server returned 200 for a ranged request */
+    long http_status;  /* offending HTTP status on a DLM_ERR_HTTP failure, else 0 */
 
     long max_retries;
     int64_t max_speed; /* total bytes/sec cap; 0 = unlimited */
@@ -190,8 +191,17 @@ static dlm_result probe(dlm_download_t *dl)
          * the headers we needed already arrived, so treat that as success. */
         if (rc == CURLE_WRITE_ERROR) rc = CURLE_OK;
         if (rc != CURLE_OK || code >= 400) {
-            DLM_ERROR("probe failed: %s (HTTP %ld)", curl_easy_strerror(rc), code);
-            return DLM_ERR_NET;
+            /* Distinguish a real transport failure ("couldn't connect") from the
+             * server answering with an error status — a 404/403/500 is a
+             * *successful* curl transfer (rc==CURLE_OK), so reporting it as a
+             * network error is misleading. */
+            if (rc != CURLE_OK) {
+                DLM_ERROR("probe failed: %s", curl_easy_strerror(rc));
+                return DLM_ERR_NET;
+            }
+            DLM_ERROR("probe failed: server returned HTTP %ld", code);
+            dl->http_status = code;
+            return DLM_ERR_HTTP;
         }
         if (code == 206) {
             dl->resumable = 1;
@@ -483,12 +493,19 @@ static dlm_result run_multi(dlm_download_t *dl)
                 DLM_DEBUG("segment %d complete (%lld bytes)", s->index,
                           (long long)s->done);
             } else {
+                /* A permanent client error (404/403/...) won't recover, so don't
+                 * waste retries on it; 408/429 and 5xx/network errors are worth
+                 * retrying. Surface the HTTP status either way (DLM_ERR_HTTP) so
+                 * the user isn't told "network error" for a server rejection. */
+                int permanent = code >= 400 && code < 500 &&
+                                code != 408 && code != 429;
                 s->retries++;
-                if (s->retries > dl->max_retries) {
-                    DLM_ERROR("segment %d failed permanently: %s (HTTP %ld)",
-                              s->index, curl_easy_strerror(res), code);
+                if (permanent || s->retries > dl->max_retries) {
+                    DLM_ERROR("segment %d failed: %s (HTTP %ld)", s->index,
+                              curl_easy_strerror(res), code);
                     s->failed = 1;
-                    result = DLM_ERR_NET;
+                    if (code >= 400) { dl->http_status = code; result = DLM_ERR_HTTP; }
+                    else result = DLM_ERR_NET;
                     goto cleanup;
                 }
                 DLM_WARN("segment %d retry %ld/%ld: %s (HTTP %ld)", s->index,
@@ -681,6 +698,7 @@ dlm_result dlm_download_file(const dlm_options *opt)
     }
 
 done:
+    if (opt->http_status) *opt->http_status = dl.http_status;
     if (dl.fd >= 0) close(dl.fd);
     if (dl.header_list) curl_slist_free_all(dl.header_list);
     free(dl.cookie);
@@ -718,13 +736,33 @@ const char *dlm_strerror(dlm_result r)
     switch (r) {
     case DLM_OK: return "ok";
     case DLM_ERR_ARG: return "invalid argument";
-    case DLM_ERR_NET: return "network error";
+    case DLM_ERR_NET: return "could not connect to the server";
     case DLM_ERR_IO: return "i/o error";
-    case DLM_ERR_HTTP: return "http error";
+    case DLM_ERR_HTTP: return "server returned an error status";
     case DLM_ERR_NOMEM: return "out of memory";
     case DLM_ERR_CANCELLED: return "cancelled";
     }
     return "unknown error";
+}
+
+void dlm_http_error_str(long code, char *buf, size_t n)
+{
+    const char *reason;
+    switch (code) {
+    case 400: reason = "bad request"; break;
+    case 401: reason = "unauthorized — login required"; break;
+    case 403: reason = "forbidden — access denied"; break;
+    case 404: case 410: reason = "file not found"; break;
+    case 408: reason = "request timed out"; break;
+    case 429: reason = "rate limited — try again later"; break;
+    default:
+        if (code >= 500) reason = "server error";
+        else if (code >= 400) reason = "request rejected";
+        else reason = NULL;
+        break;
+    }
+    if (reason) snprintf(buf, n, "HTTP %ld (%s)", code, reason);
+    else snprintf(buf, n, "HTTP %ld", code);
 }
 
 const char *dlm_version(void) { return "dlm 0.1.0"; }

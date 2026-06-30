@@ -50,6 +50,12 @@ typedef struct {
 
     /* Optional cooperative cancel flag: set *cancel to non-zero to abort. */
     volatile int *cancel;
+
+    /* Optional out: on a DLM_ERR_HTTP failure the engine writes the offending
+     * HTTP status here (e.g. 404/403/500) so the caller can tell the user the
+     * server rejected the request rather than report a generic "network error".
+     * Left untouched (caller should zero-init) when there was no HTTP status. */
+    long *http_status;
 } dlm_options;
 
 /* Download a single URL to out_path, using segmented connections and resuming
@@ -64,6 +70,11 @@ void dlm_global_cleanup(void);
 
 /* Human-readable string for a dlm_result. */
 const char *dlm_strerror(dlm_result r);
+
+/* Format a non-success HTTP status (e.g. 404) into a user-facing one-liner like
+ * "HTTP 404 (file not found)". Use when dlm_options.http_status was set, so the
+ * user sees what the server actually said instead of a generic error. */
+void dlm_http_error_str(long code, char *buf, size_t n);
 
 /* Library version string. */
 const char *dlm_version(void);
