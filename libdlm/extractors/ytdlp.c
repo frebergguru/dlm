@@ -137,6 +137,13 @@ int dlm_ytdlp_parse(const char *json_text, const char *input_url,
         DLM_ERROR("yt-dlp: unparseable JSON: %s", e.text);
         return DLM_ERR_NET;
     }
+    /* A usable info dict is always a JSON object (single video or playlist). A
+     * bare null/array (e.g. yt-dlp printed "null" for a removed video) is not
+     * something we can download — reject so the caller falls back to direct. */
+    if (!json_is_object(root)) {
+        json_decref(root);
+        return DLM_ERR_NET;
+    }
 
     out->source = dlm_xstrdup("yt-dlp");
     /* root title: playlist title for a playlist, video title for a single item;
@@ -218,21 +225,31 @@ int dlm_extract_ytdlp(const char *url, dlm_extract_result *out)
     /* No --no-playlist here: a playlist/season URL expands to one info dict per
      * entry (dlm_ytdlp_parse walks "entries"), so the whole set is staged as a
      * package. --no-playlist is kept on the per-episode download (queue.c) so a
-     * single confirmed link fetches just that video. */
+     * single confirmed link fetches just that video.
+     *
+     * --ignore-errors so a playlist with a few unavailable videos still yields
+     * the rest (yt-dlp emits null for the bad entries, which the parser skips)
+     * instead of aborting the whole crawl. */
     const char *argv[] = {dlm_tool_path("yt-dlp"), "-J", "--no-warnings",
-                          "--", url, NULL};
+                          "--ignore-errors", "--", url, NULL};
     char *json = NULL;
     int ec = 0;
     if (run_capture(argv, &json, &ec) != 0) {
         free(json);
         return DLM_ERR_NET;
     }
-    if (ec != 0 || !json || !*json) {
-        DLM_ERROR("yt-dlp: extraction failed (exit %d) for %s", ec, url);
+    if (!json || !*json) {
+        DLM_ERROR("yt-dlp: no output (exit %d) for %s", ec, url);
         free(json);
         return DLM_ERR_NET;
     }
+    /* yt-dlp can exit non-zero yet still emit a usable info JSON — a playlist
+     * where some entries failed exits 1 but lists the good ones. Parse whatever
+     * came back; dlm_ytdlp_parse rejects genuinely empty/unusable output, and
+     * the caller then falls back to a direct download. */
     int rc = dlm_ytdlp_parse(json, url, out);
+    if (rc != DLM_OK)
+        DLM_ERROR("yt-dlp: extraction failed (exit %d) for %s", ec, url);
     free(json);
     return rc;
 }

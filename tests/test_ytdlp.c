@@ -74,6 +74,20 @@ int main(void)
     CHECK(r.tasks[1].delegate == 1, "entry B hls delegated");
     dlm_extract_result_free(&r);
 
+    /* playlist with an unavailable (null) entry -> only the good one survives */
+    static const char *PLAYLIST_NULL =
+        "{\"title\":\"Mixed\",\"entries\":["
+        "null,"
+        "{\"title\":\"Ok\",\"ext\":\"mp4\",\"protocol\":\"https\",\"url\":\"https://c/o.mp4\"}"
+        "]}";
+    CHECK(dlm_ytdlp_parse(PLAYLIST_NULL, "https://s", &r) == 0, "parse playlist w/ null");
+    CHECK(r.count == 1, "null entry skipped");
+    dlm_extract_result_free(&r);
+
+    /* a bare JSON null (removed video) is not downloadable -> rejected */
+    CHECK(dlm_ytdlp_parse("null", "https://s/x", &r) != 0, "null root rejected");
+    CHECK(dlm_ytdlp_parse("[]", "https://s/x", &r) != 0, "array root rejected");
+
     if (failures == 0) { printf("test_ytdlp: all passed\n"); return 0; }
     fprintf(stderr, "test_ytdlp: %d failure(s)\n", failures);
     return 1;
