@@ -98,6 +98,9 @@ typedef struct {
     int ncsites;
     int open_menus;         /* open row popovers; rebuilds are deferred while >0 */
     int pending_rebuild;    /* a refresh arrived while a menu was open */
+    GtkWidget *spinner;     /* global activity spinner (header) */
+    AdwBanner *banner;      /* inline "Resolving…" banner */
+    int resolving;          /* in-flight URL resolves */
 } App;
 
 static App g_app;
@@ -1174,17 +1177,20 @@ static char *build_dest_dir(const char *base, const char *url,
 }
 
 /* Resolve a URL into tasks and enqueue each into `dir` on the daemon. Runs in
- * the click handler (a brief synchronous yt-dlp/IA resolve). */
-static void do_add(const char *url, const char *dir)
-{
-    if (!url || !*url) return;
-    if (!dir || !*dir) dir = ".";
+ * a worker thread (see start_resolve); `r->res` is already populated. */
+typedef struct {
+    char *url;
+    char *dir;
+    int grab;                /* 1 => stage in linkgrabber, 0 => add directly */
+    dlm_extract_result res;  /* filled by the resolve worker */
+    int ok;                  /* resolve succeeded with >0 tasks */
+} ResolveCtx;
 
-    dlm_extract_result res;
-    if (dlm_extract(url, &res) != DLM_OK || res.count == 0) {
-        toast(&g_app, "Could not resolve URL");
-        return;
-    }
+/* Enqueue each resolved task directly into the download list. */
+static void stage_add(ResolveCtx *r)
+{
+    const char *url = r->url, *dir = r->dir;
+    dlm_extract_result res = r->res;
     /* lay files out under <dir>/<host>/[<title>/] */
     char *dest = build_dest_dir(dir, url, res.title, res.count > 1);
     g_mkdir_with_parents(dest, 0755);
@@ -1208,7 +1214,6 @@ static void do_add(const char *url, const char *dir)
              added == 1 ? "download" : "files", res.source, dest);
     toast(&g_app, msg);
     g_free(dest);
-    dlm_extract_result_free(&res);
 }
 
 /* If `text` (clipboard contents) starts with a supported URL scheme, return a
@@ -1229,16 +1234,11 @@ static char *detect_url(const char *text)
     return g_strndup(text, len);
 }
 
-/* Resolve a URL and stage the tasks into the linkgrabber as one package. */
-static void do_grab(const char *url, const char *dir)
+/* Stage the resolved tasks into the linkgrabber as one package. */
+static void stage_grab(ResolveCtx *rc)
 {
-    if (!url || !*url) return;
-    if (!dir || !*dir) dir = ".";
-    dlm_extract_result res;
-    if (dlm_extract(url, &res) != DLM_OK || res.count == 0) {
-        toast(&g_app, "Could not resolve URL");
-        return;
-    }
+    const char *url = rc->url, *dir = rc->dir;
+    dlm_extract_result res = rc->res;
     /* package name: item title, else URL host, else extractor source */
     char host[256];
     host_of(url, host, sizeof host);
@@ -1278,7 +1278,77 @@ static void do_grab(const char *url, const char *dir)
              res.count == 1 ? "link" : "links", res.source);
     toast(&g_app, msg);
     g_free(dest);
-    dlm_extract_result_free(&res);
+}
+
+/* ---- async resolve: keep the slow yt-dlp/IA crawl off the UI thread ---- */
+
+/* Reflect the in-flight resolve count in the spinner + inline banner. */
+static void update_activity(App *a)
+{
+    if (!a->spinner || !a->banner) return;
+    if (a->resolving > 0) {
+        gtk_spinner_start(GTK_SPINNER(a->spinner));
+        gtk_widget_set_visible(a->spinner, TRUE);
+        adw_banner_set_revealed(a->banner, TRUE);
+    } else {
+        gtk_spinner_stop(GTK_SPINNER(a->spinner));
+        gtk_widget_set_visible(a->spinner, FALSE);
+        adw_banner_set_revealed(a->banner, FALSE);
+    }
+}
+
+/* Worker thread: resolve the URL (the potentially slow part). */
+static void resolve_worker(GTask *task, gpointer src, gpointer data, GCancellable *c)
+{
+    (void)src; (void)c;
+    ResolveCtx *rc = data;
+    rc->ok = dlm_extract(rc->url, &rc->res) == DLM_OK && rc->res.count > 0;
+    g_task_return_boolean(task, TRUE);
+}
+
+/* Main thread: resolve finished — enqueue the tasks and clear the indicator. */
+static void resolve_done(GObject *src, GAsyncResult *res, gpointer user)
+{
+    (void)src; (void)res;
+    ResolveCtx *rc = user;
+    App *a = &g_app;
+    if (a->resolving > 0) a->resolving--;
+    update_activity(a);
+    if (!rc->ok)
+        toast(a, "Could not resolve URL");
+    else if (rc->grab)
+        stage_grab(rc);
+    else
+        stage_add(rc);
+    dlm_extract_result_free(&rc->res);
+    g_free(rc->url);
+    g_free(rc->dir);
+    g_free(rc);
+}
+
+/* Kick off an async resolve of `url` into `dir`; grab => linkgrabber staging. */
+static void start_resolve(const char *url, const char *dir, int grab)
+{
+    if (!url || !*url) return;
+    if (!dir || !*dir) dir = ".";
+    App *a = &g_app;
+    ResolveCtx *rc = g_new0(ResolveCtx, 1);
+    rc->url = g_strdup(url);
+    rc->dir = g_strdup(dir);
+    rc->grab = grab;
+
+    char host[256];
+    host_of(url, host, sizeof host);
+    char banner[320];
+    if (host[0]) snprintf(banner, sizeof banner, "Checking %s…", host);
+    else snprintf(banner, sizeof banner, "Resolving…");
+    adw_banner_set_title(a->banner, banner);
+    a->resolving++;
+    update_activity(a);
+
+    GTask *t = g_task_new(NULL, NULL, resolve_done, rc);
+    g_task_run_in_thread(t, resolve_worker);
+    g_object_unref(t);
 }
 
 typedef struct { GtkEditable *url, *dir; GtkSwitch *grab; } AddEntries;
@@ -1291,10 +1361,8 @@ static void on_add_response(AdwAlertDialog *d, const char *response, gpointer us
         const char *dir = gtk_editable_get_text(e->dir);
         /* remember the chosen folder for next time */
         if (dir && *dir) { g_free(g_app.download_dir); g_app.download_dir = g_strdup(dir); }
-        if (gtk_switch_get_active(e->grab))
-            do_grab(gtk_editable_get_text(e->url), g_app.download_dir);
-        else
-            do_add(gtk_editable_get_text(e->url), g_app.download_dir);
+        start_resolve(gtk_editable_get_text(e->url), g_app.download_dir,
+                      gtk_switch_get_active(e->grab));
     }
     g_free(e);
 }
@@ -1712,7 +1780,7 @@ static void on_monitor_clip_ready(GObject *src, GAsyncResult *res, gpointer user
     if (link && g_strcmp0(link, a->clip_last) != 0) {
         g_free(a->clip_last);
         a->clip_last = g_strdup(link);
-        do_grab(link, a->download_dir);
+        start_resolve(link, a->download_dir, 1);
     }
     g_free(link);
     g_free(text);
@@ -1845,6 +1913,13 @@ static void on_activate(GtkApplication *app, gpointer user)
     g_signal_connect(settings, "clicked", G_CALLBACK(on_settings_clicked), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), settings);
 
+    /* global activity spinner: spins while a URL is being resolved/crawled */
+    GtkWidget *spinner = gtk_spinner_new();
+    a->spinner = spinner;
+    gtk_widget_set_tooltip_text(spinner, "Resolving…");
+    gtk_widget_set_visible(spinner, FALSE);
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), spinner);
+
     GtkWidget *toast_overlay = adw_toast_overlay_new();
     a->toast = ADW_TOAST_OVERLAY(toast_overlay);
     adw_toast_overlay_set_child(a->toast, stack);
@@ -1860,7 +1935,13 @@ static void on_activate(GtkApplication *app, gpointer user)
     gtk_widget_add_css_class(status, "dim-label");
     gtk_box_append(GTK_BOX(statusbar), status);
 
+    /* inline status banner, shown only while resolving a URL */
+    GtkWidget *banner = adw_banner_new("");
+    a->banner = ADW_BANNER(banner);
+    adw_banner_set_revealed(ADW_BANNER(banner), FALSE);
+
     GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_append(GTK_BOX(content), banner);
     gtk_box_append(GTK_BOX(content), toast_overlay);
     gtk_box_append(GTK_BOX(content), statusbar);
 
