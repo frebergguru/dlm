@@ -1222,6 +1222,7 @@ typedef struct {
     char *url;
     char *dir;
     int grab;                /* 1 => stage in linkgrabber, 0 => add directly */
+    int conns;               /* parallel segments per file; 0 => engine default */
     dlm_extract_result res;  /* filled by the resolve worker */
     int ok;                  /* resolve succeeded with >0 tasks */
 } ResolveCtx;
@@ -1243,6 +1244,7 @@ static void stage_add(ResolveCtx *rc)
         json_object_set_new(r, "url", json_string(res.tasks[i].url));
         json_object_set_new(r, "out", json_string(path));
         if (res.tasks[i].delegate) json_object_set_new(r, "delegate", json_true());
+        if (rc->conns > 0) json_object_set_new(r, "connections", json_integer(rc->conns));
         char *s = json_dumps(r, JSON_COMPACT);
         json_decref(r);
         send_cmd(s);
@@ -1307,6 +1309,7 @@ static void stage_grab(ResolveCtx *rc)
         json_object_set_new(l, "name", json_string(t->filename));
         json_object_set_new(l, "size", json_integer(t->size));
         if (t->delegate) json_object_set_new(l, "delegate", json_true());
+        if (rc->conns > 0) json_object_set_new(l, "connections", json_integer(rc->conns));
         json_object_set_new(l, "availability",
                             json_string(t->size >= 0 ? "online" : "unknown"));
         json_array_append_new(links, l);
@@ -1369,8 +1372,9 @@ static void resolve_done(GObject *src, GAsyncResult *res, gpointer user)
     g_free(rc);
 }
 
-/* Kick off an async resolve of `url` into `dir`; grab => linkgrabber staging. */
-static void start_resolve(const char *url, const char *dir, int grab)
+/* Kick off an async resolve of `url` into `dir`; grab => linkgrabber staging.
+ * conns is the per-file segment count (0 => engine default). */
+static void start_resolve(const char *url, const char *dir, int grab, int conns)
 {
     if (!url || !*url) return;
     if (!dir || !*dir) dir = ".";
@@ -1379,6 +1383,7 @@ static void start_resolve(const char *url, const char *dir, int grab)
     rc->url = g_strdup(url);
     rc->dir = g_strdup(dir);
     rc->grab = grab;
+    rc->conns = conns;
 
     char host[256];
     host_of(url, host, sizeof host);
@@ -1398,7 +1403,11 @@ static void start_resolve(const char *url, const char *dir, int grab)
     g_object_unref(t);
 }
 
-typedef struct { GtkEditable *url, *dir; GtkSwitch *grab; } AddEntries;
+typedef struct {
+    GtkEditable *url, *dir;
+    GtkSpinButton *conns;
+    GtkSwitch *grab;
+} AddEntries;
 
 static void on_add_response(AdwAlertDialog *d, const char *response, gpointer user)
 {
@@ -1409,7 +1418,8 @@ static void on_add_response(AdwAlertDialog *d, const char *response, gpointer us
         /* remember the chosen folder for next time */
         if (dir && *dir) { g_free(g_app.download_dir); g_app.download_dir = g_strdup(dir); }
         start_resolve(gtk_editable_get_text(e->url), g_app.download_dir,
-                      gtk_switch_get_active(e->grab));
+                      gtk_switch_get_active(e->grab),
+                      gtk_spin_button_get_value_as_int(e->conns));
     }
     g_free(e);
 }
@@ -1450,6 +1460,20 @@ static void on_add_clicked(GtkButton *b, gpointer user)
     gtk_box_append(GTK_BOX(box), url);
     gtk_box_append(GTK_BOX(box), dir);
 
+    /* connections: parallel segments per file (0 => engine default) */
+    GtkWidget *crow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_top(crow, 4);
+    GtkWidget *clabel = gtk_label_new("Connections");
+    gtk_widget_set_hexpand(clabel, TRUE);
+    gtk_label_set_xalign(GTK_LABEL(clabel), 0.0);
+    GtkWidget *conns = gtk_spin_button_new_with_range(0, 16, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(conns), 0);
+    gtk_widget_set_tooltip_text(conns, "Parallel segments per file (0 = engine default)");
+    gtk_widget_set_valign(conns, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(crow), clabel);
+    gtk_box_append(GTK_BOX(crow), conns);
+    gtk_box_append(GTK_BOX(box), crow);
+
     /* review-in-linkgrabber toggle (JDownloader-style staging) */
     GtkWidget *grow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_margin_top(grow, 4);
@@ -1472,6 +1496,7 @@ static void on_add_clicked(GtkButton *b, gpointer user)
     AddEntries *e = g_new0(AddEntries, 1);
     e->url = GTK_EDITABLE(url);
     e->dir = GTK_EDITABLE(dir);
+    e->conns = GTK_SPIN_BUTTON(conns);
     e->grab = GTK_SWITCH(gsw);
     g_signal_connect(d, "response", G_CALLBACK(on_add_response), e);
     adw_dialog_present(d, GTK_WIDGET(a->win));
@@ -1827,7 +1852,7 @@ static void on_monitor_clip_ready(GObject *src, GAsyncResult *res, gpointer user
     if (link && g_strcmp0(link, a->clip_last) != 0) {
         g_free(a->clip_last);
         a->clip_last = g_strdup(link);
-        start_resolve(link, a->download_dir, 1);
+        start_resolve(link, a->download_dir, 1, 0);
     }
     g_free(link);
     g_free(text);
@@ -1857,6 +1882,49 @@ static void on_clip_toggle(GtkToggleButton *btn, gpointer user)
     }
 }
 
+/* ---- focus grab: offer to fetch a link copied while we were away ------ */
+
+/* The toast's "Grab" button: stage the offered link into the linkgrabber. */
+static void on_offer_grab(AdwToast *t, gpointer user)
+{
+    App *a = user;
+    const char *link = g_object_get_data(G_OBJECT(t), "dlm-link");
+    if (link) start_resolve(link, a->download_dir, 1, 0);
+}
+
+/* Clipboard read finished after the window regained focus: if it holds a link
+ * we haven't surfaced yet, show a dismissable toast offering to grab it. */
+static void on_focus_clip_ready(GObject *src, GAsyncResult *res, gpointer user)
+{
+    App *a = user;
+    char *text = gdk_clipboard_read_text_finish(GDK_CLIPBOARD(src), res, NULL);
+    char *link = detect_url(text);
+    if (link && g_strcmp0(link, a->clip_last) != 0) {
+        /* share clip_last with the auto-paste monitor: a link it already grabbed
+         * won't be offered again, and an offered link won't be re-offered. */
+        g_free(a->clip_last);
+        a->clip_last = g_strdup(link);
+        AdwToast *t = adw_toast_new("Link copied — grab it?");
+        adw_toast_set_button_label(t, "Grab");
+        g_object_set_data_full(G_OBJECT(t), "dlm-link", g_strdup(link), g_free);
+        g_signal_connect(t, "button-clicked", G_CALLBACK(on_offer_grab), a);
+        adw_toast_overlay_add_toast(a->toast, t);
+    }
+    g_free(link);
+    g_free(text);
+}
+
+/* Window became active (app gained focus): peek at the clipboard. Fires on both
+ * gain and loss, so act only on gain. */
+static void on_win_active(GObject *obj, GParamSpec *ps, gpointer user)
+{
+    (void)ps;
+    App *a = user;
+    if (!gtk_window_is_active(GTK_WINDOW(obj))) return;
+    GdkClipboard *clip = gtk_widget_get_clipboard(GTK_WIDGET(a->win));
+    gdk_clipboard_read_text_async(clip, NULL, on_focus_clip_ready, a);
+}
+
 /* ---- activate / main -------------------------------------------------- */
 
 /* A boxed list box inside a scroller (one per view). */
@@ -1880,6 +1948,10 @@ static GtkWidget *make_scrolled_list(GtkListBox **out)
 static void on_activate(GtkApplication *app, gpointer user)
 {
     App *a = user;
+
+    /* single window: a second activate (or a URL opened into a running instance)
+     * just raises the existing one rather than building another. */
+    if (a->win) { gtk_window_present(a->win); return; }
 
     GtkWidget *win = adw_application_window_new(app);
     a->win = GTK_WINDOW(win);
@@ -1997,8 +2069,27 @@ static void on_activate(GtkApplication *app, gpointer user)
     adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(tv), content);
     adw_application_window_set_content(ADW_APPLICATION_WINDOW(win), tv);
 
+    /* offer to grab a link from the clipboard whenever we regain focus */
+    g_signal_connect(win, "notify::is-active", G_CALLBACK(on_win_active), a);
+
     gtk_window_present(a->win);
     connect_subscribe(a);
+}
+
+/* "Open with DLM" / `dlm-gui <url>…`: each URI is staged into the linkgrabber
+ * for review. GApplication emits this instead of "activate" when launched with
+ * arguments, so ensure the window exists first. */
+static void on_open(GApplication *app, GFile **files, gint n_files,
+                    const char *hint, gpointer user)
+{
+    (void)hint;
+    App *a = user;
+    g_application_activate(app);   /* builds the window (or raises it) */
+    for (gint i = 0; i < n_files; i++) {
+        char *uri = g_file_get_uri(files[i]);
+        start_resolve(uri, a->download_dir, 1, 0);
+        g_free(uri);
+    }
 }
 
 int main(int argc, char **argv)
@@ -2016,8 +2107,9 @@ int main(int argc, char **argv)
         g_app.download_dir = g_strdup(xdg ? xdg : g_get_home_dir());
     }
 
-    g_app.app = adw_application_new("org.dlm.Gui", G_APPLICATION_DEFAULT_FLAGS);
+    g_app.app = adw_application_new("org.dlm.Gui", G_APPLICATION_HANDLES_OPEN);
     g_signal_connect(g_app.app, "activate", G_CALLBACK(on_activate), &g_app);
+    g_signal_connect(g_app.app, "open", G_CALLBACK(on_open), &g_app);
     int status = g_application_run(G_APPLICATION(g_app.app), argc, argv);
     g_object_unref(g_app.app);
     g_string_free(g_app.rx, TRUE);
