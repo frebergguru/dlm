@@ -56,6 +56,12 @@ static int http_do(const char *url, const char *post_fields,
                    const char *const *headers, char **body, size_t *len,
                    long *status)
 {
+    /* default the out-params up front so early-error returns never leave the
+     * caller reading/freeing an uninitialised *body. */
+    if (body) *body = NULL;
+    if (len) *len = 0;
+    if (status) *status = 0;
+
     dlm_global_init();
     CURL *c = curl_easy_init();
     if (!c) return DLM_ERR_NOMEM;

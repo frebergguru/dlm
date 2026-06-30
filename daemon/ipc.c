@@ -8,6 +8,7 @@
 #include "dlm/tools.h"
 
 #include <jansson.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -162,8 +163,9 @@ static int parse_grab_links(json_t *arr, dlm_grab_link **out)
 {
     if (!json_is_array(arr)) return -1;
     size_t n = json_array_size(arr);
-    if (n == 0) return -1;
+    if (n == 0 || n > (size_t)INT_MAX) return -1;
     dlm_grab_link *links = calloc(n, sizeof *links);
+    if (!links) return -1;
     size_t i;
     json_t *o;
     json_array_foreach(arr, i, o) {

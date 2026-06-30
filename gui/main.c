@@ -1431,7 +1431,11 @@ static void on_add_clip_ready(GObject *src, GAsyncResult *res, gpointer user)
     GtkEditable *url = user;            /* held with a ref until this fires */
     char *text = gdk_clipboard_read_text_finish(GDK_CLIPBOARD(src), res, NULL);
     char *link = detect_url(text);
-    if (link && (!gtk_editable_get_text(url) || !*gtk_editable_get_text(url)))
+    /* The dialog may have been dismissed while the read was in flight; the ref
+     * keeps the object alive but it's disposed/unrooted by then, so only touch
+     * it while it's still in a window (otherwise gtk_editable_* would warn). */
+    if (link && gtk_widget_get_root(GTK_WIDGET(url)) &&
+        (!gtk_editable_get_text(url) || !*gtk_editable_get_text(url)))
         gtk_editable_set_text(url, link);
     g_free(link);
     g_free(text);
@@ -2114,6 +2118,8 @@ int main(int argc, char **argv)
     g_object_unref(g_app.app);
     g_string_free(g_app.rx, TRUE);
     g_free(g_app.clip_last);
+    g_free(g_app.last_event);
+    g_free(g_app.download_dir);
     for (int i = 0; i < g_app.ncsites; i++) g_free(g_app.csites[i]);
     g_free(g_app.csites);
     free_items(&g_app);

@@ -176,7 +176,17 @@ int dlm_sock_set_nonblock(dlm_sock_t fd)
 }
 
 long dlm_sock_read(dlm_sock_t fd, void *buf, size_t n) { return read(fd, buf, n); }
-long dlm_sock_write(dlm_sock_t fd, const void *buf, size_t n) { return write(fd, buf, n); }
+long dlm_sock_write(dlm_sock_t fd, const void *buf, size_t n)
+{
+    /* MSG_NOSIGNAL: writing to a peer that already closed must return EPIPE,
+     * not raise SIGPIPE — otherwise a one-shot CLI (which doesn't ignore the
+     * signal) is killed instead of getting a clean error. */
+#ifdef MSG_NOSIGNAL
+    return send(fd, buf, n, MSG_NOSIGNAL);
+#else
+    return send(fd, buf, n, 0);
+#endif
+}
 void dlm_sock_close(dlm_sock_t fd) { close(fd); }
 
 int dlm_sock_would_block(void) { return errno == EAGAIN || errno == EWOULDBLOCK; }

@@ -122,6 +122,9 @@ dlm_store *dlm_store_open(const char *path)
         sqlite3_close(db);
         return NULL;
     }
+    /* WAL still takes a brief write lock; without a busy timeout a CLI write
+     * racing the daemon's tick gets an instant SQLITE_BUSY and is lost. */
+    sqlite3_busy_timeout(db, 3000);
     char *err = NULL;
     if (sqlite3_exec(db, SCHEMA, NULL, NULL, &err) != SQLITE_OK) {
         DLM_ERROR("store: schema init failed: %s", err ? err : "?");

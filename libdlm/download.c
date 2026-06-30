@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <jansson.h>
 #include <stdarg.h>
+#include <sys/stat.h>
 #if defined(_WIN32)
 #  include <io.h>
 #else
@@ -122,11 +123,13 @@ static size_t probe_header_cb(char *buf, size_t size, size_t nmemb, void *userp)
     return len;
 }
 
-/* discard body bytes during probe */
-static size_t discard_cb(char *p, size_t s, size_t n, void *u)
+/* Abort the body transfer during the GET probe: returning 0 tells libcurl to
+ * stop (CURLE_WRITE_ERROR), so a server that ignores "Range: 0-0" and answers
+ * 200 doesn't make us stream the whole file just to read its headers. */
+static size_t probe_abort_cb(char *p, size_t s, size_t n, void *u)
 {
-    (void)p; (void)u;
-    return s * n;
+    (void)p; (void)s; (void)n; (void)u;
+    return 0;
 }
 
 static void apply_common_opts(CURL *c, dlm_download_t *dl)
@@ -174,11 +177,14 @@ static dlm_result probe(dlm_download_t *dl)
         curl_easy_setopt(c, CURLOPT_RANGE, "0-0");
         curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, probe_header_cb);
         curl_easy_setopt(c, CURLOPT_HEADERDATA, &ph);
-        curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, discard_cb);
+        curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, probe_abort_cb);
         rc = curl_easy_perform(c);
         code = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         curl_easy_cleanup(c);
+        /* probe_abort_cb stops the body, which surfaces as CURLE_WRITE_ERROR;
+         * the headers we needed already arrived, so treat that as success. */
+        if (rc == CURLE_WRITE_ERROR) rc = CURLE_OK;
         if (rc != CURLE_OK || code >= 400) {
             DLM_ERROR("probe failed: %s (HTTP %ld)", curl_easy_strerror(rc), code);
             return DLM_ERR_NET;
@@ -462,8 +468,13 @@ static dlm_result run_multi(dlm_download_t *dl)
             if (dl->range_ignored) { result = DLM_ERR_HTTP; goto cleanup; }
 
             int http_ok = (code == 200 || code == 206 || code == 0);
-            if (res == CURLE_OK && http_ok &&
-                (s->end < 0 || seg_is_done(s))) {
+            /* For an open-ended segment (end==-1) curl's own Content-Length
+             * check guards short reads when the size is known; when it isn't
+             * (dl->total<0) we can only trust CURLE_OK. When it IS known, also
+             * require the whole file so a clean mid-body close isn't accepted. */
+            int len_ok = (s->end >= 0) ? seg_is_done(s)
+                       : (dl->total < 0 || s->done >= dl->total);
+            if (res == CURLE_OK && http_ok && len_ok) {
                 s->complete = 1;
                 DLM_DEBUG("segment %d complete (%lld bytes)", s->index,
                           (long long)s->done);
@@ -487,6 +498,10 @@ static dlm_result run_multi(dlm_download_t *dl)
 
         emit_progress(dl, 0);
         if (dlm_now() - last_journal >= DLM_JOURNAL_INTERVAL) {
+            /* flush the data before recording progress, so a crash can't leave
+             * the journal claiming bytes that never reached disk (resume would
+             * then skip them and silently corrupt the output). */
+            dlm_fsync(dl->fd);
             journal_save(dl);
             last_journal = dlm_now();
         }
@@ -502,6 +517,7 @@ cleanup:
         }
     }
     curl_multi_cleanup(multi);
+    dlm_fsync(dl->fd);
     journal_save(dl);
     emit_progress(dl, 1);
     return result;
@@ -518,12 +534,38 @@ static struct curl_slist *build_header_list(const char *const *headers)
     return list;
 }
 
-static dlm_result open_part_file(dlm_download_t *dl)
+/* Largest byte offset the journal claims is already written to the part file. */
+static int64_t resume_extent(const dlm_download_t *dl)
 {
+    int64_t max = 0;
+    for (int i = 0; i < dl->nsegments; i++) {
+        int64_t ext = dl->segs[i].start + dl->segs[i].done;
+        if (ext > max) max = ext;
+    }
+    return max;
+}
+
+/* Open (creating) the .dlmpart file. If need_extent>0 (a journal was loaded)
+ * and the existing file is too small to hold those bytes — e.g. it was deleted
+ * or truncated by something else between runs — *stale is set so the caller can
+ * discard the stale progress and restart cleanly instead of resuming over holes. */
+static dlm_result open_part_file(dlm_download_t *dl, int64_t need_extent, int *stale)
+{
+    if (stale) *stale = 0;
     dl->fd = open(dl->part_path, O_RDWR | O_CREAT | DLM_O_BINARY, 0644);
     if (dl->fd < 0) {
         DLM_ERROR("cannot open %s: %s", dl->part_path, strerror(errno));
         return DLM_ERR_IO;
+    }
+    if (stale && need_extent > 0) {
+        struct stat st;
+        int64_t have = (fstat(dl->fd, &st) == 0) ? (int64_t)st.st_size : 0;
+        if (have < need_extent) {
+            DLM_WARN("resume: %s holds %lld bytes but the journal expects >= %lld;"
+                     " restarting clean", dl->part_path, (long long)have,
+                     (long long)need_extent);
+            *stale = 1;
+        }
     }
     if (dl->total > 0) {
         if (dlm_ftruncate(dl->fd, dl->total) != 0) {
@@ -571,11 +613,22 @@ dlm_result dlm_download_file(const dlm_options *opt)
     dlm_result rc = probe(&dl);
     if (rc != DLM_OK) goto done;
 
-    if (!journal_load(&dl))
+    int resumed = journal_load(&dl);
+    if (!resumed)
         plan_segments(&dl, connections, min_split);
 
-    rc = open_part_file(&dl);
+    int stale = 0;
+    rc = open_part_file(&dl, resumed ? resume_extent(&dl) : 0, &stale);
     if (rc != DLM_OK) goto done;
+    if (stale) {
+        /* journal outlived its part file; throw the progress away and re-plan
+         * from zero (the file is now truncated to total, so every byte is
+         * re-fetched and overwritten — no holes survive). */
+        free(dl.segs);
+        dl.segs = NULL;
+        dl.downloaded = 0;
+        plan_segments(&dl, connections, min_split);
+    }
 
     rc = run_multi(&dl);
 

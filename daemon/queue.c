@@ -884,15 +884,17 @@ static void apply_force(dlm_queue *q, qitem *it, int unused)
     if (it->list != DLM_LIST_DOWNLOAD) return;
     it->enabled = 1;
     it->force = 1;
+    dlm_store_set_enabled(q->store, it->id, 1);
+    dlm_store_set_force(q->store, it->id, 1);
+    /* only re-queue (and persist that) a stopped item; forcing an already
+     * active one must not write a bogus "queued" state over the live worker. */
     if (it->state == Q_PAUSED || it->state == Q_ERROR) {
         it->state = Q_QUEUED;
         it->cancel = 0;
         free(it->error);
         it->error = NULL;
+        dlm_store_set_state(q->store, it->id, "queued", NULL);
     }
-    dlm_store_set_enabled(q->store, it->id, 1);
-    dlm_store_set_force(q->store, it->id, 1);
-    dlm_store_set_state(q->store, it->id, "queued", NULL);
 }
 
 int dlm_queue_set_priority(dlm_queue *q, int64_t id, int is_package, int prio)
@@ -1112,14 +1114,18 @@ static int start_item(dlm_queue *q, qitem *it)
     it->state = Q_ERROR;
     free(it->error);
     it->error = xstrdup("failed to start worker thread");
+    dlm_store_set_state(q->store, it->id, "error", it->error);
     return 0;
 }
 
-/* True if a link may be auto-started by the scheduler right now. */
+/* True if a link may be auto-started by the scheduler right now. Links crawled
+ * as "offline" are skipped so they don't churn through Q_ERROR; an explicit
+ * force still starts them (the force loop doesn't consult this). */
 static int eligible(qitem *it)
 {
     return it->list == DLM_LIST_DOWNLOAD && it->state == Q_QUEUED &&
-           !it->has_thread && it->enabled && it->autostart;
+           !it->has_thread && it->enabled && it->autostart &&
+           (!it->availability || strcmp(it->availability, "offline") != 0);
 }
 
 void dlm_queue_tick(dlm_queue *q)
@@ -1133,8 +1139,13 @@ void dlm_queue_tick(dlm_queue *q)
             pthread_join(it->thread, NULL);
             it->has_thread = 0;
             it->finished = 0;
-            it->force = 0;
-            dlm_store_set_force(q->store, it->id, 0);
+            /* A finished worker leaves the item in DONE/ERROR/PAUSED. If it is
+             * Q_QUEUED here, a force/resume command landed between the worker
+             * finishing and this reap — keep its force flag so it still starts. */
+            if (it->state != Q_QUEUED) {
+                it->force = 0;
+                dlm_store_set_force(q->store, it->id, 0);
+            }
             dlm_store_set_progress(q->store, it->id, it->total, it->downloaded);
             if (it->remove_requested) {
                 int64_t pkg_id = it->package_id;

@@ -409,7 +409,11 @@ static int download_ytdlp(void)
             return -1;
         }
     } else {
-        DLM_WARN("tools: could not fetch yt-dlp checksum; proceeding unverified");
+        /* No checksum -> don't install an unverified executable we will run.
+         * Leave any existing yt-dlp in place; a later update attempt retries. */
+        DLM_WARN("tools: could not fetch yt-dlp checksum; refusing to install unverified");
+        remove(tmp);
+        return -1;
     }
     make_executable(tmp);
     if (dlm_rename_replace(tmp, dest) != 0) { remove(tmp); return -1; }

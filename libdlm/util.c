@@ -224,6 +224,8 @@ int64_t dlm_parse_rate(const char *s)
     }
     double bytes = v * mult;
     if (bytes < 1) bytes = 1;
+    /* clamp before the cast: (int64_t)(double > INT64_MAX) is undefined */
+    if (bytes > 9.2e18) return INT64_MAX;
     return (int64_t)bytes;
 }
 

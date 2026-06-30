@@ -166,7 +166,8 @@ int dlm_ia_logout(void)
 void dlm_ia_free_headers(char **h)
 {
     if (!h) return;
-    for (int i = 0; h[i]; i++) free(h[i]);
+    /* these carry the S3 secret / session cookie; scrub before releasing */
+    for (int i = 0; h[i]; i++) { secure_zero(h[i], strlen(h[i])); free(h[i]); }
     free(h);
 }
 

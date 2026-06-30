@@ -20,6 +20,10 @@
 #  define DLMD_NAME "/dlmd"
 #endif
 
+/* upper bound on a single protocol line; a peer that never sends '\n' must not
+ * be able to grow the read buffer without limit */
+#define DLM_LINE_MAX (16u * 1024 * 1024)
+
 /* The public API speaks in int fds; on Windows a SOCKET round-trips through int
  * (user-mode socket handles fit), and the compat layer does the real work. */
 static int try_connect(const char *path)
@@ -157,6 +161,7 @@ char *dlm_client_read_line(int fd)
         }
         if (c == '\n') break;
         if (len + 1 >= cap) {
+            if (cap >= DLM_LINE_MAX) { free(buf); return NULL; } /* refuse runaway lines */
             char *nb = realloc(buf, cap * 2);
             if (!nb) { free(buf); return NULL; }
             buf = nb;
@@ -185,6 +190,7 @@ char *dlm_client_reader_line(dlm_client_reader *r)
             char c = r->buf[r->start++];
             if (c == '\n') { line[len] = '\0'; return line; }
             if (len + 1 >= cap) {
+                if (cap >= DLM_LINE_MAX) { free(line); return NULL; } /* refuse runaway lines */
                 char *nb = realloc(line, cap * 2);
                 if (!nb) { free(line); return NULL; }
                 line = nb;
