@@ -24,6 +24,11 @@ int dlm_http_get_blob(const char *url, const char *const *headers, char **body,
 /* case-insensitive prefix test (returns 1 if `s` starts with `p`) */
 int dlm_ci_prefix(const char *s, const char *p);
 
+/* Lock a curl easy handle (CURL* via void*) to web protocols on request and
+ * redirects — http/https, plus ftp/ftps when allow_ftp. Blocks file://, scp,
+ * gopher, dict (local-file read / SSRF). Works on any libcurl version. */
+void dlm_curl_restrict_protocols(void *handle, int allow_ftp);
+
 /* Attach a session cookie to a curl easy handle via the cookie engine, scoped to
  * the URL host's domain and marked Secure (see httpget.c). `handle` is a CURL*.
  * Use this instead of a raw "Cookie:" header so the secret can't leak across a

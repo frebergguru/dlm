@@ -104,8 +104,12 @@ void dlm_socket_path(char *buf, size_t n)
     snprintf(buf, n, "%s/dlm.sock", rt);
 #else
     const char *rt = getenv("XDG_RUNTIME_DIR");
+    /* XDG_RUNTIME_DIR is already a private 0700 per-user dir. The /tmp fallback
+     * is world-writable, so put the socket in our own per-user subdir (created
+     * 0700 and ownership-checked at bind, see dlm_unix_listen) rather than
+     * directly in /tmp where another user could pre-plant it. */
     if (rt && *rt) snprintf(buf, n, "%s/dlm.sock", rt);
-    else snprintf(buf, n, "/tmp/dlm-%d.sock", (int)getuid());
+    else snprintf(buf, n, "/tmp/dlm-%d/dlm.sock", (int)getuid());
 #endif
 }
 

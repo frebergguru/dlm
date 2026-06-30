@@ -5,6 +5,7 @@
 #endif
 #include "compat/dlm_sock.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -144,11 +145,31 @@ static int set_sun(struct sockaddr_un *a, const char *path)
     return 0;
 }
 
+/* Ensure the socket's parent directory exists and can't be used by another user
+ * to pre-plant a socket: create it 0700, or (if it exists) require that we own
+ * it and it isn't group/world-writable. Returns 0 on success. */
+static int ensure_private_parent(const char *sockpath)
+{
+    char dir[256];
+    snprintf(dir, sizeof dir, "%s", sockpath);
+    char *slash = strrchr(dir, '/');
+    if (!slash || slash == dir) return 0; /* no parent (or root) — nothing to do */
+    *slash = '\0';
+    if (mkdir(dir, 0700) == 0) return 0;  /* freshly created and private */
+    if (errno != EEXIST) return -1;
+    struct stat st;
+    if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) return -1;
+    if (st.st_uid != geteuid()) return -1;            /* someone else owns it */
+    if (st.st_mode & (S_IWGRP | S_IWOTH)) return -1;  /* others could plant here */
+    return 0;
+}
+
 dlm_sock_t dlm_unix_listen(const char *path, int backlog)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return DLM_INVALID_SOCK;
     fcntl(fd, F_SETFD, FD_CLOEXEC); /* don't leak the control socket to children */
+    if (ensure_private_parent(path) != 0) { close(fd); return DLM_INVALID_SOCK; }
     struct sockaddr_un a;
     if (set_sun(&a, path) != 0) { close(fd); return DLM_INVALID_SOCK; }
     unlink(path); /* clear any stale socket */

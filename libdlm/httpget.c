@@ -12,6 +12,26 @@
 #define HTTPGET_UA "dlm/0.1 (+segmented-downloader)"
 #define HTTPGET_MAX (64 * 1024 * 1024) /* cap response bodies at 64 MiB */
 
+/* Restrict a handle to web protocols (and ftp if allow_ftp) on both the request
+ * and redirects, so an attacker URL/redirect can't reach file:// (local-file
+ * read) or scp/gopher/dict (SSRF). The *_STR options need libcurl 7.85; fall
+ * back to the always-available bitmask so the restriction applies on any
+ * version (a missing restriction would silently re-open the hole). */
+void dlm_curl_restrict_protocols(void *handle, int allow_ftp)
+{
+    CURL *c = handle;
+#if LIBCURL_VERSION_NUM >= 0x075500
+    const char *p = allow_ftp ? "http,https,ftp,ftps" : "http,https";
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, p);
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, p);
+#else
+    long p = CURLPROTO_HTTP | CURLPROTO_HTTPS |
+             (allow_ftp ? (CURLPROTO_FTP | CURLPROTO_FTPS) : 0);
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS, p);
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS, p);
+#endif
+}
+
 /* case-insensitive "does s start with prefix p?" */
 int dlm_ci_prefix(const char *s, const char *p)
 {
@@ -148,8 +168,7 @@ static int http_do(const char *url, const char *post_fields,
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 20L);
     /* restrict to web protocols (no file://, scp, gopher, dict) on the request
      * and on redirects — defends the metadata/API fetches against SSRF too */
-    curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
-    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+    dlm_curl_restrict_protocols(c, 0 /* http/https only */);
     curl_easy_setopt(c, CURLOPT_SSLVERSION, (long)CURL_SSLVERSION_TLSv1_2);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_USERAGENT, HTTPGET_UA);
