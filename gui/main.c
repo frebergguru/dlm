@@ -1130,6 +1130,49 @@ static void schedule_reconnect(App *a)
 
 /* ---- add dialog ------------------------------------------------------- */
 
+/* Sanitize one path segment: neutralise filesystem-hostile characters
+ * (/ \ : * ? " < > | and control chars). Caller g_free()s. */
+static char *sanitize_segment(const char *s)
+{
+    if (!s || !*s) return g_strdup("");
+    char *out = g_strdup(s);
+    for (char *p = out; *p; p++) {
+        switch ((unsigned char)*p) {
+        case '/': case '\\': case ':': case '*': case '?':
+        case '"': case '<': case '>': case '|': *p = '_'; break;
+        default: if ((unsigned char)*p < 0x20) *p = '_';
+        }
+    }
+    return out;
+}
+
+/* Destination directory for an extracted item: "<base>/<host>[/<title>]". The
+ * host comes from the source URL; the title segment is added only for a
+ * multi-file item (archive.org item, yt-dlp playlist/season) with a known
+ * title, so single files land directly under "<base>/<host>/". Caller g_free()s. */
+static char *build_dest_dir(const char *base, const char *url,
+                            const char *title, int multi)
+{
+    char host[256];
+    host_of(url, host, sizeof host);
+    char *dir;
+    if (host[0]) {
+        char *hseg = sanitize_segment(host);
+        dir = g_build_filename(base, hseg, NULL);
+        g_free(hseg);
+    } else {
+        dir = g_strdup(base);
+    }
+    if (multi && title && *title) {
+        char *tseg = sanitize_segment(title);
+        char *sub = g_build_filename(dir, tseg, NULL);
+        g_free(dir);
+        g_free(tseg);
+        dir = sub;
+    }
+    return dir;
+}
+
 /* Resolve a URL into tasks and enqueue each into `dir` on the daemon. Runs in
  * the click handler (a brief synchronous yt-dlp/IA resolve). */
 static void do_add(const char *url, const char *dir)
@@ -1142,11 +1185,13 @@ static void do_add(const char *url, const char *dir)
         toast(&g_app, "Could not resolve URL");
         return;
     }
-    g_mkdir_with_parents(dir, 0755);
+    /* lay files out under <dir>/<host>/[<title>/] */
+    char *dest = build_dest_dir(dir, url, res.title, res.count > 1);
+    g_mkdir_with_parents(dest, 0755);
     int added = 0;
     for (int i = 0; i < res.count; i++) {
         char path[4096];
-        snprintf(path, sizeof path, "%s/%s", dir, res.tasks[i].filename);
+        snprintf(path, sizeof path, "%s/%s", dest, res.tasks[i].filename);
         json_t *r = json_object();
         json_object_set_new(r, "cmd", json_string("add"));
         json_object_set_new(r, "url", json_string(res.tasks[i].url));
@@ -1158,10 +1203,11 @@ static void do_add(const char *url, const char *dir)
         free(s);
         added++;
     }
-    char msg[96];
+    char msg[4096];
     snprintf(msg, sizeof msg, "Added %d %s (%s) to %s", added,
-             added == 1 ? "download" : "files", res.source, dir);
+             added == 1 ? "download" : "files", res.source, dest);
     toast(&g_app, msg);
+    g_free(dest);
     dlm_extract_result_free(&res);
 }
 
@@ -1193,23 +1239,25 @@ static void do_grab(const char *url, const char *dir)
         toast(&g_app, "Could not resolve URL");
         return;
     }
-    /* package name: URL basename, else extractor source */
-    char pkgname[256];
-    const char *b = strrchr(url, '/');
-    b = b ? b + 1 : url;
-    size_t bl = strcspn(b, "?#");
-    if (bl == 0 || bl >= sizeof pkgname) snprintf(pkgname, sizeof pkgname, "%s", res.source);
-    else { memcpy(pkgname, b, bl); pkgname[bl] = '\0'; }
+    /* package name: item title, else URL host, else extractor source */
+    char host[256];
+    host_of(url, host, sizeof host);
+    const char *pkgname = (res.title && *res.title) ? res.title
+                        : host[0]                    ? host
+                                                     : res.source;
+
+    /* lay files out under <dir>/<host>/[<title>/] (title only for multi-file) */
+    char *dest = build_dest_dir(dir, url, res.title, res.count > 1);
 
     json_t *r = json_object();
     json_object_set_new(r, "cmd", json_string("grab"));
     json_object_set_new(r, "name", json_string(pkgname));
-    json_object_set_new(r, "folder", json_string(dir));
+    json_object_set_new(r, "folder", json_string(dest));
     json_t *links = json_array();
     for (int i = 0; i < res.count; i++) {
         dlm_task *t = &res.tasks[i];
         char path[4096];
-        snprintf(path, sizeof path, "%s/%s", dir, t->filename);
+        snprintf(path, sizeof path, "%s/%s", dest, t->filename);
         json_t *l = json_object();
         json_object_set_new(l, "url", json_string(t->url));
         json_object_set_new(l, "out", json_string(path));
@@ -1229,6 +1277,7 @@ static void do_grab(const char *url, const char *dir)
     snprintf(msg, sizeof msg, "Staged %d %s (%s) in the linkgrabber", res.count,
              res.count == 1 ? "link" : "links", res.source);
     toast(&g_app, msg);
+    g_free(dest);
     dlm_extract_result_free(&res);
 }
 
