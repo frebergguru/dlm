@@ -65,6 +65,7 @@ typedef struct {
     char *name;
     char *folder;
     char *list;
+    char *source_url;      /* URL the user added; host drives grouping + favicon */
     int priority;
     int collapsed;
     int links;
@@ -303,6 +304,7 @@ static const char *current_filter(App *a)
 
 static void on_pkg_edit_clicked(GtkButton *b, gpointer u); /* fwd */
 static void rebuild_list(App *a);                          /* fwd */
+static void item_host(App *a, Dl *d, char *buf, size_t len); /* fwd */
 
 /* ---- site grouping: host / name / favicon ---------------------------- */
 
@@ -475,7 +477,7 @@ static void on_site_confirm(GtkButton *b, gpointer user)
     for (int i = 0; i < a->n; i++) {
         Dl *d = &a->items[i];
         if (!d->list || strcmp(d->list, "linkgrabber")) continue;
-        char h[256]; host_of(d->url, h, sizeof h);
+        char h[256]; item_host(a, d, h, sizeof h);
         if (strcmp(h, host)) continue;
         char cmd[128];
         snprintf(cmd, sizeof cmd,
@@ -774,11 +776,13 @@ static int item_has_pkg(App *a, Dl *d, const char *view)
     return 0;
 }
 
-/* Host of a package = host of its first link in `view` (packages are
- * single-site in practice, since each grab stages one source URL). */
+/* Host of a package: the host of the source URL the user added (per-task URLs
+ * are often opaque, e.g. yt-dlp's "nrk:ID"). Falls back to the first link's
+ * host for older packages with no stored source URL. */
 static void pkg_host(App *a, Pkg *p, const char *view, char *buf, size_t len)
 {
     if (len) buf[0] = '\0';
+    if (p->source_url && *p->source_url) { host_of(p->source_url, buf, len); return; }
     for (int i = 0; i < a->n; i++) {
         Dl *d = &a->items[i];
         if (d->package_id == p->id && d->list && !strcmp(d->list, view)) {
@@ -786,6 +790,22 @@ static void pkg_host(App *a, Pkg *p, const char *view, char *buf, size_t len)
             return;
         }
     }
+}
+
+/* The site host for a link: its package's source-URL host when the link belongs
+ * to a package, otherwise the link's own URL host (loose direct adds). */
+static void item_host(App *a, Dl *d, char *buf, size_t len)
+{
+    if (d->package_id > 0)
+        for (int pi = 0; pi < a->npkg; pi++)
+            if (a->pkgs[pi].id == d->package_id) {
+                if (a->pkgs[pi].source_url && *a->pkgs[pi].source_url) {
+                    host_of(a->pkgs[pi].source_url, buf, len);
+                    return;
+                }
+                break;
+            }
+    host_of(d->url, buf, len);
 }
 
 /* Classic package grouping (used for the downloads view and "Packages" mode). */
@@ -837,7 +857,7 @@ static int render_site_view(App *a, GtkListBox *list, const char *view,
         Dl *d = &a->items[i];
         if (!d->list || strcmp(d->list, view)) continue;
         if (!item_passes(d, filter, linkgrabber)) continue;
-        char h[256]; host_of(d->url, h, sizeof h);
+        char h[256]; item_host(a, d, h, sizeof h);
         int seen = 0;
         for (guint k = 0; k < hosts->len; k++)
             if (!strcmp(g_ptr_array_index(hosts, k), h)) { seen = 1; break; }
@@ -852,7 +872,7 @@ static int render_site_view(App *a, GtkListBox *list, const char *view,
             Dl *d = &a->items[i];
             if (!d->list || strcmp(d->list, view)) continue;
             if (!item_passes(d, filter, linkgrabber)) continue;
-            char h[256]; host_of(d->url, h, sizeof h);
+            char h[256]; item_host(a, d, h, sizeof h);
             if (!strcmp(h, host)) count++;
         }
         gtk_list_box_append(list, make_site_header(a, host, count, linkgrabber));
@@ -882,7 +902,7 @@ static int render_site_view(App *a, GtkListBox *list, const char *view,
                 if (!d->list || strcmp(d->list, view)) continue;
                 if (item_has_pkg(a, d, view)) continue;
                 if (!item_passes(d, filter, linkgrabber)) continue;
-                char h[256]; host_of(d->url, h, sizeof h);
+                char h[256]; item_host(a, d, h, sizeof h);
                 if (strcmp(h, host)) continue;
                 gtk_list_box_append(list, make_row(d, linkgrabber));
             }
@@ -892,7 +912,7 @@ static int render_site_view(App *a, GtkListBox *list, const char *view,
                 Dl *d = &a->items[i];
                 if (!d->list || strcmp(d->list, view)) continue;
                 if (!item_passes(d, filter, linkgrabber)) continue;
-                char h[256]; host_of(d->url, h, sizeof h);
+                char h[256]; item_host(a, d, h, sizeof h);
                 if (strcmp(h, host)) continue;
                 gtk_list_box_append(list, make_row(d, linkgrabber));
             }
@@ -986,6 +1006,7 @@ static void free_pkgs(App *a)
         g_free(a->pkgs[i].name);
         g_free(a->pkgs[i].folder);
         g_free(a->pkgs[i].list);
+        g_free(a->pkgs[i].source_url);
     }
     free(a->pkgs);
     a->pkgs = NULL;
@@ -1007,6 +1028,7 @@ static void apply_packages(App *a, json_t *arr)
         p->name = g_strdup(json_string_value(json_object_get(o, "name")));
         p->folder = g_strdup(json_string_value(json_object_get(o, "folder")));
         p->list = g_strdup(json_string_value(json_object_get(o, "list")));
+        p->source_url = g_strdup(json_string_value(json_object_get(o, "source_url")));
         p->priority = json_integer_value(json_object_get(o, "priority"));
         p->collapsed = json_is_true(json_object_get(o, "collapsed"));
         p->links = json_integer_value(json_object_get(o, "links"));
@@ -1263,6 +1285,9 @@ static void stage_grab(ResolveCtx *rc)
     json_object_set_new(r, "cmd", json_string("grab"));
     json_object_set_new(r, "name", json_string(pkgname));
     json_object_set_new(r, "folder", json_string(dest));
+    /* remember the URL the user added: the list groups + draws favicons by its
+     * host, since per-task URLs are often opaque (e.g. yt-dlp's "nrk:ID"). */
+    json_object_set_new(r, "source_url", json_string(url));
     json_t *links = json_array();
     for (int i = 0; i < res.count; i++) {
         dlm_task *t = &res.tasks[i];
