@@ -20,6 +20,7 @@
 #include "dlm/verify.h"
 #include "compat/compat.h"
 
+#include <ctype.h>
 #include <jansson.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,58 @@ static void default_download_dir(char *buf, size_t len)
         }
     }
     snprintf(buf, len, ".");
+}
+
+/* ---- host/title save layout (mirrors the GUI) ------------------------- */
+
+/* Extract the bare host from a URL into buf (scheme/userinfo/port/path stripped,
+ * leading "www." dropped). Empty for schemeless URLs like magnet:. */
+static void host_of(const char *url, char *buf, size_t len)
+{
+    if (len) buf[0] = '\0';
+    if (!url || !len) return;
+    const char *p = strstr(url, "://");
+    p = p ? p + 3 : url;
+    const char *slash = strchr(p, '/');
+    const char *at = strchr(p, '@');
+    if (at && (!slash || at < slash)) p = at + 1;     /* drop user:pass@ */
+    size_t i = 0;
+    while (*p && *p != '/' && *p != ':' && *p != '?' && *p != '#' && i < len - 1)
+        buf[i++] = (char)tolower((unsigned char)*p++);
+    buf[i] = '\0';
+    if (strncmp(buf, "www.", 4) == 0) memmove(buf, buf + 4, strlen(buf + 4) + 1);
+}
+
+/* Neutralise filesystem-hostile characters in a path segment, in place. */
+static void sanitize_segment(char *s)
+{
+    for (; *s; s++) {
+        switch ((unsigned char)*s) {
+        case '/': case '\\': case ':': case '*': case '?':
+        case '"': case '<': case '>': case '|': *s = '_'; break;
+        default: if ((unsigned char)*s < 0x20) *s = '_';
+        }
+    }
+}
+
+/* Build "<base>/<host>[/<title>]" into buf. The title segment is added only for
+ * a multi-file item (archive.org item, yt-dlp playlist/season) with a title, so
+ * a single file lands directly under "<base>/<host>/". */
+static void build_dest_dir(char *buf, size_t len, const char *base,
+                           const char *url, const char *title, int multi)
+{
+    char host[256];
+    host_of(url, host, sizeof host);
+    sanitize_segment(host);
+    char tseg[512] = "";
+    if (multi && title && *title) {
+        snprintf(tseg, sizeof tseg, "%s", title);
+        sanitize_segment(tseg);
+    }
+    if (host[0] && tseg[0]) snprintf(buf, len, "%s/%s/%s", base, host, tseg);
+    else if (host[0])       snprintf(buf, len, "%s/%s", base, host);
+    else if (tseg[0])       snprintf(buf, len, "%s/%s", base, tseg);
+    else                    snprintf(buf, len, "%s", base);
 }
 
 static void progress(void *ud, int64_t done, int64_t total, double bps)
@@ -216,8 +269,10 @@ static int cmd_get(int argc, char **argv)
     if (res.count == 1 && out) {
         rc = download_task(&res.tasks[0], out, conns, limit);
     } else {
-        /* one or more files: place them under the chosen directory */
-        const char *d = dir ? dir : ".";
+        /* one or more files: place them under <dir>/<host>/[<title>/] */
+        char d[2048];
+        build_dest_dir(d, sizeof d, dir ? dir : ".", url, res.title,
+                       res.count > 1);
         if (strcmp(d, ".") != 0) dlm_mkdir_p(d);
         if (res.count > 1)
             fprintf(stderr, "dlm: %s -> %d files into %s/\n", res.source, res.count, d);
@@ -436,10 +491,13 @@ static int cmd_add(int argc, char **argv)
         return 1;
     }
 
-    /* destination directory: -d, else the default download dir */
+    /* destination directory: -d, else the default download dir, then nested as
+     * <dir>/<host>/[<title>/] to match the GUI's save layout */
     char dbuf[1024];
     if (!dir) { default_download_dir(dbuf, sizeof dbuf); dir = dbuf; }
-    if (strcmp(dir, ".") != 0) dlm_mkdir_p(dir);
+    char dest[2048];
+    build_dest_dir(dest, sizeof dest, dir, url, res.title, res.count > 1);
+    if (strcmp(dest, ".") != 0) dlm_mkdir_p(dest);
 
     int fd = dlm_client_connect();
     if (fd < 0) { dlm_extract_result_free(&res); return 1; }
@@ -450,14 +508,14 @@ static int cmd_add(int argc, char **argv)
         if (res.count == 1 && out)
             snprintf(path, sizeof path, "%s", out);
         else
-            snprintf(path, sizeof path, "%s/%s", dir, res.tasks[i].filename);
+            snprintf(path, sizeof path, "%s/%s", dest, res.tasks[i].filename);
         added += send_add(fd, res.tasks[i].url, path, conns, res.tasks[i].delegate);
     }
     dlm_client_close(fd);
     if (res.count == 1)
-        printf("added 1 download (%s) to %s\n", res.source, dir);
+        printf("added 1 download (%s) to %s\n", res.source, dest);
     else
-        printf("added %d/%d files (%s) to %s/\n", added, res.count, res.source, dir);
+        printf("added %d/%d files (%s) to %s/\n", added, res.count, res.source, dest);
     dlm_extract_result_free(&res);
     return added > 0 ? 0 : 1;
 }
@@ -791,22 +849,25 @@ static int cmd_grab(int argc, char **argv)
     char dbuf[1024];
     if (!dir) { default_download_dir(dbuf, sizeof dbuf); dir = dbuf; }
 
-    /* package name: the URL's last path component, else the extractor name */
-    char pkgname[256];
-    const char *base = strrchr(url, '/');
-    base = base ? base + 1 : url;
-    size_t blen = strcspn(base, "?#");
-    if (blen == 0 || blen >= sizeof pkgname) snprintf(pkgname, sizeof pkgname, "%s", res.source);
-    else { memcpy(pkgname, base, blen); pkgname[blen] = '\0'; }
+    /* package name: item title, else URL host, else the extractor name */
+    char host[256];
+    host_of(url, host, sizeof host);
+    const char *pkgname = (res.title && *res.title) ? res.title
+                        : host[0]                    ? host
+                                                     : res.source;
+
+    /* lay files out under <dir>/<host>/[<title>/] (title only for multi-file) */
+    char dest[2048];
+    build_dest_dir(dest, sizeof dest, dir, url, res.title, res.count > 1);
 
     json_t *req = req_obj("grab");
     json_object_set_new(req, "name", json_string(pkgname));
-    json_object_set_new(req, "folder", json_string(dir));
+    json_object_set_new(req, "folder", json_string(dest));
     json_t *links = json_array();
     for (int i = 0; i < res.count; i++) {
         dlm_task *t = &res.tasks[i];
         char path[4096];
-        snprintf(path, sizeof path, "%s/%s", dir, t->filename);
+        snprintf(path, sizeof path, "%s/%s", dest, t->filename);
         json_t *l = json_object();
         json_object_set_new(l, "url", json_string(t->url));
         json_object_set_new(l, "out", json_string(path));
