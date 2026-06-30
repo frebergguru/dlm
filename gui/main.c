@@ -98,6 +98,7 @@ typedef struct {
     int ncsites;
     int open_menus;         /* open row popovers; rebuilds are deferred while >0 */
     int pending_rebuild;    /* a refresh arrived while a menu was open */
+    char *last_event;       /* last subscribe payload; identical => skip rebuild */
     GtkWidget *spinner;     /* global activity spinner (header) */
     AdwBanner *banner;      /* inline "Resolving…" banner */
     int resolving;          /* in-flight URL resolves */
@@ -1046,6 +1047,15 @@ static void apply_downloads(App *a, json_t *arr)
 
 static void handle_line(App *a, const char *line)
 {
+    /* The daemon re-sends the full state every 0.5s even when nothing changed
+     * (e.g. while reviewing the linkgrabber with nothing downloading). Skip
+     * identical payloads so the list isn't torn down and rebuilt under the
+     * user — a constant rebuild destroys row/menu widgets mid-click and makes
+     * the ⋮ menus impossible to open. */
+    if (a->last_event && strcmp(a->last_event, line) == 0) return;
+    g_free(a->last_event);
+    a->last_event = g_strdup(line);
+
     json_error_t e;
     json_t *root = json_loads(line, 0, &e);
     if (!root) return;
@@ -1347,6 +1357,10 @@ static void start_resolve(const char *url, const char *dir, int grab)
     update_activity(a);
 
     GTask *t = g_task_new(NULL, NULL, resolve_done, rc);
+    /* the worker reads `rc` via task_data (its 3rd arg); the completion callback
+     * reads it via the g_task_new user_data. Free ownership stays with
+     * resolve_done, so task_data gets no destroy func (avoids a double free). */
+    g_task_set_task_data(t, rc, NULL);
     g_task_run_in_thread(t, resolve_worker);
     g_object_unref(t);
 }
