@@ -773,4 +773,4 @@ void dlm_http_error_str(long code, char *buf, size_t n)
     else snprintf(buf, n, "HTTP %ld", code);
 }
 
-const char *dlm_version(void) { return "dlm 0.1.0"; }
+const char *dlm_version(void) { return "dlm 0.6.0"; }

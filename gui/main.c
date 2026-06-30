@@ -611,6 +611,44 @@ static void on_site_confirm(GtkButton *b, gpointer user)
     toast(a, msg);
 }
 
+/* ---- shared styling: hierarchy bands + accent tint ------------------- *
+ * Mirrors the mobile review screen so the level is readable at a glance:
+ * site headers sit on the strongest tinted band, package headers on a
+ * lighter one, and file rows on the plain list background. `dlm-accent`
+ * colours folder/confirm glyphs with the theme accent. Colours reference
+ * libadwaita named colours, so they follow light/dark + accent automatically. */
+static void dlm_load_css(void)
+{
+    static const char css[] =
+        ".dlm-site-header { background-color: alpha(@window_fg_color, 0.10); }"
+        ".dlm-pkg-header  { background-color: alpha(@window_fg_color, 0.05); }"
+        ".dlm-accent      { color: @accent_color; }";
+    GtkCssProvider *p = gtk_css_provider_new();
+    gtk_css_provider_load_from_string(p, css);
+    gtk_style_context_add_provider_for_display(
+        gdk_display_get_default(), GTK_STYLE_PROVIDER(p),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(p);
+}
+
+/* A 24px file-type glyph for a link row (disc / image / video / doc …, like the
+ * mobile review list). The icon is derived from the filename's content type and
+ * carried as a themed GIcon, whose built-in name fallback chain lets every icon
+ * theme (Adwaita, Breeze, …) resolve its own symbolic glyph instead of dropping
+ * to a generic page. */
+static GtkWidget *file_type_image(const char *name)
+{
+    char *content = (name && *name) ? g_content_type_guess(name, NULL, 0, NULL) : NULL;
+    GIcon *icon = content ? g_content_type_get_symbolic_icon(content) : NULL;
+    GtkWidget *img = icon ? gtk_image_new_from_gicon(icon)
+                          : gtk_image_new_from_icon_name("text-x-generic-symbolic");
+    if (icon) g_object_unref(icon);
+    g_free(content);
+    gtk_image_set_pixel_size(GTK_IMAGE(img), 24);
+    gtk_widget_set_valign(img, GTK_ALIGN_CENTER);
+    return img;
+}
+
 /* A site group header: favicon, friendly name, link count, collapse + confirm. */
 static GtkWidget *make_site_header(App *a, const char *host, int count,
                                    int linkgrabber)
@@ -623,6 +661,7 @@ static GtkWidget *make_site_header(App *a, const char *host, int count,
     gtk_widget_set_margin_start(outer, 8);
     gtk_widget_set_margin_end(outer, 12);
     gtk_widget_add_css_class(outer, "toolbar");
+    gtk_widget_add_css_class(row, "dlm-site-header");   /* strongest band */
 
     int collapsed = site_collapsed(a, host);
     GtkWidget *ct = gtk_button_new_from_icon_name(
@@ -656,6 +695,7 @@ static GtkWidget *make_site_header(App *a, const char *host, int count,
     if (linkgrabber) {
         GtkWidget *confirm = gtk_button_new_from_icon_name("object-select-symbolic");
         gtk_widget_add_css_class(confirm, "flat");
+        gtk_widget_add_css_class(confirm, "dlm-accent");
         gtk_widget_set_valign(confirm, GTK_ALIGN_CENTER);
         gtk_widget_set_tooltip_text(confirm, "Confirm all links from this site");
         g_object_set_data_full(G_OBJECT(confirm), "host", g_strdup(host), g_free);
@@ -679,6 +719,9 @@ static GtkWidget *make_row(Dl *d, int linkgrabber, int indent)
     gtk_widget_set_margin_bottom(outer, 8);
     gtk_widget_set_margin_start(outer, (linkgrabber ? 12 : 24) + indent); /* indent under pkg */
     gtk_widget_set_margin_end(outer, 12);
+
+    /* file-type glyph (disc / image / video / doc …) so files read at a glance */
+    gtk_box_append(GTK_BOX(outer), file_type_image(d->name));
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     gtk_widget_set_hexpand(vbox, TRUE);
@@ -806,6 +849,7 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber, int indent)
     gtk_widget_set_margin_start(outer, 8 + indent);
     gtk_widget_set_margin_end(outer, 12);
     gtk_widget_add_css_class(outer, "toolbar");
+    gtk_widget_add_css_class(row, "dlm-pkg-header");     /* lighter band than site */
 
     /* collapse/expand toggle */
     ActionCtx ce = ctx_make("pkg", p->id, 0);
@@ -813,6 +857,13 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber, int indent)
     gtk_box_append(GTK_BOX(outer),
         quick_btn(p->collapsed ? "pan-end-symbolic" : "pan-down-symbolic",
                   p->collapsed ? "Expand" : "Collapse", ce));
+
+    /* accent folder glyph marks a package, as on mobile */
+    GtkWidget *folder = gtk_image_new_from_icon_name("folder-symbolic");
+    gtk_image_set_pixel_size(GTK_IMAGE(folder), 24);
+    gtk_widget_set_valign(folder, GTK_ALIGN_CENTER);
+    gtk_widget_add_css_class(folder, "dlm-accent");
+    gtk_box_append(GTK_BOX(outer), folder);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     gtk_widget_set_hexpand(vbox, TRUE);
@@ -838,8 +889,9 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber, int indent)
 
     if (linkgrabber) {
         ActionCtx cf = ctx_make("confirm", id, 1); cf.startflag = 1;
-        gtk_box_append(GTK_BOX(btns),
-                       quick_btn("object-select-symbolic", "Confirm package", cf));
+        GtkWidget *cb = quick_btn("object-select-symbolic", "Confirm package", cf);
+        gtk_widget_add_css_class(cb, "dlm-accent");
+        gtk_box_append(GTK_BOX(btns), cb);
     }
 
     GtkWidget *box;
@@ -1795,14 +1847,59 @@ static void on_filter_changed(GtkDropDown *dd, GParamSpec *ps, gpointer user)
     rebuild_list((App *)user);
 }
 
-/* linkgrabber grouping: 0=Site+packages, 1=Site, 2=Packages (see enum). */
-static void on_group_changed(GtkDropDown *dd, GParamSpec *ps, gpointer user)
+/* linkgrabber grouping: 0=Site+packages, 1=Site, 2=Packages (see enum). Driven
+ * by a segmented toggle, mirroring the mobile review screen. Labels must match
+ * the GROUP_* enum order. */
+static const char *const k_group_labels[] = {"Site + packages", "Site", "Packages"};
+
+#if ADW_CHECK_VERSION(1, 7, 0)
+static void on_group_changed(AdwToggleGroup *tg, GParamSpec *ps, gpointer user)
 {
     (void)ps;
     App *a = user;
-    a->group_mode = (int)gtk_drop_down_get_selected(dd);
+    a->group_mode = (int)adw_toggle_group_get_active(tg);
     rebuild_list(a);
 }
+static GtkWidget *make_group_switch(App *a)
+{
+    GtkWidget *tg = adw_toggle_group_new();
+    for (int i = 0; i < 3; i++) {
+        AdwToggle *t = adw_toggle_new();
+        adw_toggle_set_label(t, k_group_labels[i]);
+        adw_toggle_group_add(ADW_TOGGLE_GROUP(tg), t);
+    }
+    adw_toggle_group_set_active(ADW_TOGGLE_GROUP(tg), a->group_mode);
+    gtk_widget_set_tooltip_text(tg, "Group downloads & linkgrabber by site or package");
+    g_signal_connect(tg, "notify::active", G_CALLBACK(on_group_changed), a);
+    return tg;
+}
+#else
+/* Fallback for libadwaita < 1.7: a linked row of radio-style toggle buttons,
+ * which renders as the same segmented control. */
+static void on_group_changed(GtkToggleButton *b, gpointer user)
+{
+    if (!gtk_toggle_button_get_active(b)) return;   /* act only on the new one */
+    App *a = user;
+    a->group_mode = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "mode"));
+    rebuild_list(a);
+}
+static GtkWidget *make_group_switch(App *a)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(box, "linked");
+    GtkWidget *first = NULL;
+    for (int i = 0; i < 3; i++) {
+        GtkWidget *b = gtk_toggle_button_new_with_label(k_group_labels[i]);
+        if (!first) first = b;
+        else gtk_toggle_button_set_group(GTK_TOGGLE_BUTTON(b), GTK_TOGGLE_BUTTON(first));
+        g_object_set_data(G_OBJECT(b), "mode", GINT_TO_POINTER(i));
+        if (i == a->group_mode) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(b), TRUE);
+        g_signal_connect(b, "toggled", G_CALLBACK(on_group_changed), a);
+        gtk_box_append(GTK_BOX(box), b);
+    }
+    return box;
+}
+#endif
 
 /* ---- settings (max concurrent + global speed limit) ------------------ */
 
@@ -1872,6 +1969,22 @@ static void query_settings(int *max_active, gint64 *max_speed, int *auto_tools,
         if (v && ytver && verlen) snprintf(ytver, verlen, "%s", v);
     }
     json_decref(root);
+}
+
+/* About: surfaces the running version (dlm_version() drives the CLI too). */
+static void on_about_clicked(GtkButton *b, gpointer user)
+{
+    (void)b;
+    App *a = user;
+    const char *v = dlm_version();          /* "dlm 0.6.0" -> show "0.6.0" */
+    const char *sp = strchr(v, ' ');
+    AdwAboutDialog *about = ADW_ABOUT_DIALOG(adw_about_dialog_new());
+    adw_about_dialog_set_application_name(about, "dlm");
+    adw_about_dialog_set_application_icon(about, "folder-download-symbolic");
+    adw_about_dialog_set_version(about, sp ? sp + 1 : v);
+    adw_about_dialog_set_developer_name(about, "dlm");
+    adw_about_dialog_set_license_type(about, GTK_LICENSE_GPL_3_0);
+    adw_dialog_present(ADW_DIALOG(about), GTK_WIDGET(a->win));
 }
 
 static void on_settings_clicked(GtkButton *b, gpointer user)
@@ -2083,6 +2196,8 @@ static void on_activate(GtkApplication *app, gpointer user)
      * just raises the existing one rather than building another. */
     if (a->win) { gtk_window_present(a->win); return; }
 
+    dlm_load_css();   /* hierarchy band + accent styling, once per process */
+
     GtkWidget *win = adw_application_window_new(app);
     a->win = GTK_WINDOW(win);
     gtk_window_set_title(a->win, "dlm");
@@ -2126,14 +2241,6 @@ static void on_activate(GtkApplication *app, gpointer user)
     g_signal_connect(filter, "notify::selected", G_CALLBACK(on_filter_changed), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), filter);
 
-    /* grouping mode (order must match the GROUP_* enum) */
-    const char *const groups[] = {"Site + packages", "Site", "Packages", NULL};
-    GtkWidget *group = gtk_drop_down_new_from_strings(groups);
-    gtk_drop_down_set_selected(GTK_DROP_DOWN(group), a->group_mode);
-    gtk_widget_set_tooltip_text(group, "Group downloads & linkgrabber by site or package");
-    g_signal_connect(group, "notify::selected", G_CALLBACK(on_group_changed), a);
-    adw_header_bar_pack_end(ADW_HEADER_BAR(header), group);
-
     GtkWidget *clear = gtk_button_new_from_icon_name("edit-clear-all-symbolic");
     gtk_widget_set_tooltip_text(clear, "Clear finished downloads");
     g_signal_connect(clear, "clicked", G_CALLBACK(on_clear_finished), a);
@@ -2161,6 +2268,11 @@ static void on_activate(GtkApplication *app, gpointer user)
     gtk_widget_set_tooltip_text(settings, "Settings (concurrency, speed limit)");
     g_signal_connect(settings, "clicked", G_CALLBACK(on_settings_clicked), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), settings);
+
+    GtkWidget *about = gtk_button_new_from_icon_name("help-about-symbolic");
+    gtk_widget_set_tooltip_text(about, "About dlm (version)");
+    g_signal_connect(about, "clicked", G_CALLBACK(on_about_clicked), a);
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), about);
 
     /* global activity spinner: spins while a URL is being resolved/crawled */
     GtkWidget *spinner = gtk_spinner_new();
@@ -2196,6 +2308,17 @@ static void on_activate(GtkApplication *app, gpointer user)
 
     GtkWidget *tv = adw_toolbar_view_new();
     adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(tv), header);
+
+    /* grouping toggle directly under the header, like the mobile review screen:
+     * a centred segmented control that drives both lists */
+    GtkWidget *groupbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(groupbar, "toolbar");
+    GtkWidget *gswitch = make_group_switch(a);
+    gtk_widget_set_halign(gswitch, GTK_ALIGN_CENTER);
+    gtk_widget_set_hexpand(gswitch, TRUE);
+    gtk_box_append(GTK_BOX(groupbar), gswitch);
+    adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(tv), groupbar);
+
     adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(tv), content);
     adw_application_window_set_content(ADW_APPLICATION_WINDOW(win), tv);
 
