@@ -23,9 +23,11 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 #if defined(_WIN32)
 #  include <io.h>
+#  include <process.h>
 #  include <windows.h>
 #  define EXE_SUFFIX ".exe"
 #  define PATH_LIST_SEP ';'
@@ -174,82 +176,197 @@ static int tool_present(const char *name)
     return which_tool(name, onpath, sizeof onpath);
 }
 
-/* ---- state.json ------------------------------------------------------- */
+/* ---- locks ------------------------------------------------------------
+ *
+ * Two independent locks, each an in-process mutex (threads of the daemon: the
+ * hourly tools thread, IPC "tools_update", workers) plus a cross-process file
+ * lock (daemon + CLI + GUI):
+ *   - the TOOLS lock (<tools>/.lock) serialises downloads/installs; it is held
+ *     for the whole acquire..release span, which can be long;
+ *   - the STATE lock (<tools>/.state.lock) serialises state.json
+ *     load-modify-save; it is only ever held briefly and never across network
+ *     I/O.
+ * Lock order: TOOLS may be held while taking STATE, never the reverse. Neither
+ * is re-entrant: no function below takes a lock it may already hold. */
 
-static json_t *load_state(void)
+static pthread_mutex_t g_tools_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_state_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+#if defined(_WIN32)
+typedef HANDLE flock_t;
+#  define FLOCK_NONE INVALID_HANDLE_VALUE
+/* opening with no sharing serializes processes */
+static flock_t file_lock_open(const char *name)
 {
+    char dir[512], path[600];
+    tools_dir(dir, sizeof dir);
+    dlm_mkdir_p(dir);
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    for (int tries = 0; tries < 300; tries++) {
+        HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) return h;
+        Sleep(100);
+    }
+    return FLOCK_NONE;
+}
+static void file_lock_close(flock_t h)
+{
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+}
+#else
+typedef int flock_t;
+#  define FLOCK_NONE (-1)
+static flock_t file_lock_open(const char *name)
+{
+    char dir[512], path[600];
+    tools_dir(dir, sizeof dir);
+    dlm_mkdir_p(dir);
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    int fd = open(path, O_CREAT | O_RDWR | DLM_O_CLOEXEC, 0644); /* don't leak to children */
+    if (fd < 0) return FLOCK_NONE;
+    if (flock(fd, LOCK_EX) != 0) { close(fd); return FLOCK_NONE; }
+    return fd;
+}
+static void file_lock_close(flock_t fd)
+{
+    if (fd >= 0) { flock(fd, LOCK_UN); close(fd); }
+}
+#endif
+
+/* Only touched while g_tools_mtx is held. */
+static flock_t g_lock = FLOCK_NONE;
+
+/* Cross-process + cross-thread tools lock (daemon + CLI must not both
+ * download). On success the caller holds it until lock_release(). */
+static int lock_acquire(void)
+{
+    pthread_mutex_lock(&g_tools_mtx);
+    flock_t h = file_lock_open(".lock");
+    if (h == FLOCK_NONE) {
+        pthread_mutex_unlock(&g_tools_mtx);
+        return -1;
+    }
+    g_lock = h;
+    return 0;
+}
+
+static void lock_release(void)
+{
+    flock_t h = g_lock;
+    g_lock = FLOCK_NONE;
+    file_lock_close(h);
+    pthread_mutex_unlock(&g_tools_mtx);
+}
+
+/* State lock: returns the file lock (FLOCK_NONE if the file lock could not be
+ * taken; the in-process mutex is still held then, so threads stay serialised). */
+static flock_t state_lock(void)
+{
+    pthread_mutex_lock(&g_state_mtx);
+    flock_t h = file_lock_open(".state.lock");
+    if (h == FLOCK_NONE) DLM_WARN("tools: cannot lock state.json; continuing unlocked");
+    return h;
+}
+
+static void state_unlock(flock_t h)
+{
+    file_lock_close(h);
+    pthread_mutex_unlock(&g_state_mtx);
+}
+
+/* ---- state.json (call only with the state lock held) ------------------ */
+
+/* Last successfully read "auto" value: -1 unknown, else 0/1. Guarded by
+ * g_state_mtx. Used when state.json exists but is unreadable. */
+static int g_auto_known = -1;
+
+/* Load state.json. A missing or empty file yields a fresh object. If the file
+ * exists with content but does not parse to an object, *corrupt is set (and a
+ * fresh object is still returned so readers can carry on); callers must then
+ * not save, so a damaged file is never silently replaced by defaults. */
+static json_t *load_state_locked(int *corrupt)
+{
+    *corrupt = 0;
     char path[600];
     state_path(path, sizeof path);
     json_error_t e;
     json_t *root = json_load_file(path, 0, &e);
-    if (!root || !json_is_object(root)) {
-        if (root) json_decref(root);
-        root = json_object();
+    if (root && json_is_object(root)) return root;
+    if (root) json_decref(root);
+    struct stat st;
+    if (stat(path, &st) == 0 && st.st_size > 0) {
+        DLM_WARN("tools: %s exists but cannot be parsed (%s); not overwriting it",
+                 path, e.text);
+        *corrupt = 1;
     }
-    return root;
+    return json_object();
 }
 
-static int save_state(json_t *root)
+static int save_state_locked(json_t *root)
 {
+    static unsigned long counter = 0; /* guarded by g_state_mtx */
     char dir[512];
     tools_dir(dir, sizeof dir);
     dlm_mkdir_p(dir);
 
-    char path[600], tmp[640];
+    char path[600], tmp[700];
     state_path(path, sizeof path);
-    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    /* unique per process + call, so no two writers ever share a temp file */
+#if defined(_WIN32)
+    long pid = (long)_getpid();
+#else
+    long pid = (long)getpid();
+#endif
+    snprintf(tmp, sizeof tmp, "%s.%ld.%lu.tmp", path, pid, ++counter);
 
     if (json_dump_file(root, tmp, JSON_INDENT(2)) != 0) {
         DLM_WARN("tools: cannot write %s", tmp);
+        remove(tmp);
         return -1;
     }
     if (dlm_rename_replace(tmp, path) != 0) {
         DLM_WARN("tools: cannot rename state into place");
+        remove(tmp);
         return -1;
     }
     return 0;
 }
 
-/* ---- cross-process lock (daemon + CLI must not both download) --------- */
+/* Read-only snapshot of state.json (taken under the state lock). */
+static json_t *load_state(void)
+{
+    flock_t h = state_lock();
+    int corrupt = 0;
+    json_t *root = load_state_locked(&corrupt);
+    state_unlock(h);
+    return root;
+}
 
-#if defined(_WIN32)
-static HANDLE g_lock = INVALID_HANDLE_VALUE;
-static int lock_acquire(void)
+/* Atomic load-modify-save of state.json under the state lock. `fn` edits the
+ * loaded object in place. If the existing file is unreadable it is left alone
+ * (returns -1 without saving). */
+static int state_update(void (*fn)(json_t *root, void *ctx), void *ctx)
 {
-    char dir[512], path[600];
-    tools_dir(dir, sizeof dir);
-    dlm_mkdir_p(dir);
-    snprintf(path, sizeof path, "%s/.lock", dir);
-    /* opening with no sharing serializes processes */
-    for (int tries = 0; tries < 300; tries++) {
-        g_lock = CreateFileA(path, GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (g_lock != INVALID_HANDLE_VALUE) return 0;
-        Sleep(100);
+    flock_t h = state_lock();
+    int corrupt = 0;
+    json_t *root = load_state_locked(&corrupt);
+    int rc = -1;
+    if (!corrupt) {
+        fn(root, ctx);
+        rc = save_state_locked(root);
     }
-    return -1;
+    json_decref(root);
+    state_unlock(h);
+    return rc;
 }
-static void lock_release(void)
+
+/* Get (creating if needed) the "ytdlp" sub-object. */
+static json_t *ytdlp_obj(json_t *root)
 {
-    if (g_lock != INVALID_HANDLE_VALUE) { CloseHandle(g_lock); g_lock = INVALID_HANDLE_VALUE; }
+    json_t *yt = json_object_get(root, "ytdlp");
+    if (!json_is_object(yt)) { yt = json_object(); json_object_set_new(root, "ytdlp", yt); }
+    return yt;
 }
-#else
-static int g_lock = -1;
-static int lock_acquire(void)
-{
-    char dir[512], path[600];
-    tools_dir(dir, sizeof dir);
-    dlm_mkdir_p(dir);
-    snprintf(path, sizeof path, "%s/.lock", dir);
-    g_lock = open(path, O_CREAT | O_RDWR | DLM_O_CLOEXEC, 0644); /* don't leak to children */
-    if (g_lock < 0) return -1;
-    if (flock(g_lock, LOCK_EX) != 0) { close(g_lock); g_lock = -1; return -1; }
-    return 0;
-}
-static void lock_release(void)
-{
-    if (g_lock >= 0) { flock(g_lock, LOCK_UN); close(g_lock); g_lock = -1; }
-}
-#endif
 
 /* ---- auto switch ------------------------------------------------------ */
 
@@ -262,20 +379,43 @@ static int env_disables_auto(void)
 int dlm_tools_auto_enabled(void)
 {
     if (env_disables_auto()) return 0;
-    json_t *root = load_state();
-    json_t *a = json_object_get(root, "auto");
-    int on = a ? json_is_true(a) || (json_is_integer(a) && json_integer_value(a)) : 1;
-    if (!a) on = 1; /* default on */
+    flock_t h = state_lock();
+    int corrupt = 0;
+    json_t *root = load_state_locked(&corrupt);
+    int on;
+    if (corrupt) {
+        /* Don't silently fall back to "on": keep the last value we saw in this
+         * process, or treat auto-tools as off if we never saw one. */
+        on = g_auto_known >= 0 ? g_auto_known : 0;
+    } else {
+        json_t *a = json_object_get(root, "auto");
+        on = a ? json_is_true(a) || (json_is_integer(a) && json_integer_value(a)) : 1;
+        if (!a) on = 1; /* default on */
+        g_auto_known = on;
+    }
     json_decref(root);
+    state_unlock(h);
     return on;
 }
 
 void dlm_tools_set_auto_enabled(int on)
 {
-    json_t *root = load_state();
+    flock_t h = state_lock();
+    int corrupt = 0;
+    json_t *root = load_state_locked(&corrupt);
+    if (corrupt) {
+        /* An explicit user choice may replace an unreadable file, but keep the
+         * damaged copy aside instead of destroying it. */
+        char path[600], bak[640];
+        state_path(path, sizeof path);
+        snprintf(bak, sizeof bak, "%s.corrupt", path);
+        if (dlm_rename_replace(path, bak) == 0)
+            DLM_WARN("tools: moved unreadable state.json to %s", bak);
+    }
     json_object_set_new(root, "auto", on ? json_true() : json_false());
-    save_state(root);
+    if (save_state_locked(root) == 0) g_auto_known = on ? 1 : 0;
     json_decref(root);
+    state_unlock(h);
 }
 
 /* ---- download primitives ---------------------------------------------- */
@@ -332,35 +472,64 @@ static int run_cmd(const char *const argv[])
     return ec;
 }
 
-/* Fetch the SHA2-256SUMS file and return the hex for `asset` (or NULL). */
-static char *fetch_ytdlp_sha256(const char *asset)
+/* Fetch a sha256sum-style list ("<hex>  <name>" or "<hex> *<name>" per line)
+ * and return the hex for `asset` (or NULL if missing/unfetchable). */
+static char *fetch_sha256_for(const char *sums_url, const char *asset)
 {
     char *body = NULL;
     long status = 0;
-    if (dlm_http_get(YTDLP_DL_BASE "SHA2-256SUMS", NULL, &body, &status) != DLM_OK ||
+    if (dlm_http_get(sums_url, NULL, &body, &status) != DLM_OK ||
         status != 200 || !body)
         { free(body); return NULL; }
     char *hex = NULL;
-    char *line = strtok(body, "\n");
+    char *save = NULL;
     size_t alen = strlen(asset);
-    while (line) {
-        /* format: "<hex>  <asset>" */
-        char *sp = strstr(line, "  ");
-        if (sp) {
-            const char *fname = sp + 2;
-            size_t flen = strlen(fname);
-            while (flen && (fname[flen - 1] == '\r' || fname[flen - 1] == ' ')) flen--;
-            if (flen == alen && strncmp(fname, asset, alen) == 0) {
-                size_t hlen = (size_t)(sp - line);
-                hex = malloc(hlen + 1);
-                if (hex) { memcpy(hex, line, hlen); hex[hlen] = '\0'; }
-                break;
-            }
+    for (char *line = strtok_r(body, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        /* hex digest = leading run of hex digits, then whitespace */
+        size_t hlen = 0;
+        while ((line[hlen] >= '0' && line[hlen] <= '9') ||
+               (line[hlen] >= 'a' && line[hlen] <= 'f') ||
+               (line[hlen] >= 'A' && line[hlen] <= 'F'))
+            hlen++;
+        if (hlen != 64 || (line[hlen] != ' ' && line[hlen] != '\t')) continue;
+        const char *fname = line + hlen;
+        while (*fname == ' ' || *fname == '\t') fname++;
+        if (*fname == '*') fname++;              /* binary-mode marker */
+        if (fname[0] == '.' && fname[1] == '/') fname += 2;
+        size_t flen = strlen(fname);
+        while (flen && (fname[flen - 1] == '\r' || fname[flen - 1] == ' ')) flen--;
+        if (flen == alen && strncmp(fname, asset, alen) == 0) {
+            hex = malloc(hlen + 1);
+            if (hex) { memcpy(hex, line, hlen); hex[hlen] = '\0'; }
+            break;
         }
-        line = strtok(NULL, "\n");
     }
     free(body);
     return hex;
+}
+
+/* Fetch the SHA2-256SUMS file and return the hex for `asset` (or NULL). */
+static char *fetch_ytdlp_sha256(const char *asset)
+{
+    return fetch_sha256_for(YTDLP_DL_BASE "SHA2-256SUMS", asset);
+}
+
+/* True if an archive member name is safe to pass to `tar -x` and to join
+ * under the extract dir: not option-looking, not absolute, no ".." parts. */
+static int member_name_safe(const char *m)
+{
+    if (!m || !*m || m[0] == '-') return 0;
+    if (m[0] == '/' || m[0] == '\\') return 0;
+    if (((m[0] >= 'A' && m[0] <= 'Z') || (m[0] >= 'a' && m[0] <= 'z')) && m[1] == ':')
+        return 0; /* Windows drive path */
+    const char *p = m;
+    while (*p) {
+        size_t n = strcspn(p, "/\\");
+        if (n == 2 && p[0] == '.' && p[1] == '.') return 0;
+        p += n;
+        if (*p) p++;
+    }
+    return 1;
 }
 
 /* Query the latest yt-dlp release tag (e.g. "2026.01.15"). Returns 0 on success. */
@@ -449,6 +618,23 @@ static int download_ffmpeg(void)
     DLM_INFO("tools: downloading ffmpeg ...");
     if (download_to_file(FFMPEG_DL_BASE FFMPEG_ARCHIVE, archive) != 0) {
         DLM_WARN("tools: ffmpeg download failed; using PATH");
+        remove(archive);
+        return -1;
+    }
+
+    /* Verify against the release's published checksums before unpacking
+     * anything we will later execute (same policy as yt-dlp). */
+    char *sha = fetch_sha256_for(FFMPEG_DL_BASE "checksums.sha256", FFMPEG_ARCHIVE);
+    if (!sha) {
+        DLM_WARN("tools: could not fetch ffmpeg checksum; refusing to install unverified");
+        remove(archive);
+        return -1;
+    }
+    int v = dlm_verify_sha256(archive, sha);
+    free(sha);
+    if (v != DLM_VERIFY_OK) {
+        DLM_WARN("tools: ffmpeg checksum mismatch; discarding download");
+        remove(archive);
         return -1;
     }
 
@@ -470,8 +656,8 @@ static int download_ffmpeg(void)
         /* find a member ending in needle */
         char member[1024] = {0};
         char *copy = dlm_xstrdup(members);
-        char *line = strtok(copy, "\n");
-        while (line) {
+        char *save = NULL;
+        for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
             size_t ll = strlen(line);
             while (ll && (line[ll - 1] == '\r' || line[ll - 1] == '\n')) line[--ll] = '\0';
             size_t nl = strlen(needle);
@@ -479,12 +665,17 @@ static int download_ffmpeg(void)
                 snprintf(member, sizeof member, "%s", line);
                 break;
             }
-            line = strtok(NULL, "\n");
         }
         free(copy);
         if (!member[0]) { ok = 0; DLM_WARN("tools: %s not found in archive", wants[w]); continue; }
+        if (!member_name_safe(member)) {
+            ok = 0;
+            DLM_WARN("tools: refusing unsafe archive member name for %s", wants[w]);
+            continue;
+        }
 
-        const char *ex[] = {"tar", "-xf", archive, "-C", extract, member, NULL};
+        /* "--" so the member can never be parsed as a tar option */
+        const char *ex[] = {"tar", "-xf", archive, "-C", extract, "--", member, NULL};
         if (run_cmd(ex) != 0) { ok = 0; continue; }
 
         char src[2200], dest[1024];
@@ -508,6 +699,49 @@ static int download_ffmpeg(void)
 #endif
 }
 
+/* ---- state edits ------------------------------------------------------ */
+
+struct ytdlp_install {
+    const char *version; /* installed version, or NULL if not installed/unknown */
+    char vbuf[64];
+    time_t when;         /* installed_at (when version != NULL or installed) */
+    time_t last_check;   /* 0 = leave unchanged */
+    int installed;       /* set by check_updates; ensure_ready always installs */
+};
+
+static void apply_ytdlp_install(json_t *root, void *ctx)
+{
+    const struct ytdlp_install *ins = ctx;
+    json_t *yt = ytdlp_obj(root);
+    if (ins->version)
+        json_object_set_new(yt, "version", json_string(ins->version));
+    json_object_set_new(yt, "installed_at", json_integer((json_int_t)ins->when));
+    if (ins->last_check)
+        json_object_set_new(yt, "last_check", json_integer((json_int_t)ins->last_check));
+}
+
+static void apply_last_check(json_t *root, void *ctx)
+{
+    const struct ytdlp_install *ins = ctx;
+    json_object_set_new(ytdlp_obj(root), "last_check", json_integer((json_int_t)ins->last_check));
+}
+
+/* Current recorded yt-dlp version (malloc'd) and last_check, read under the
+ * state lock. */
+static char *recorded_ytdlp(json_int_t *last_check)
+{
+    json_t *root = load_state();
+    json_t *yt = json_object_get(root, "ytdlp");
+    if (last_check) {
+        json_t *lc = json_object_get(yt, "last_check");
+        *last_check = json_is_integer(lc) ? json_integer_value(lc) : 0;
+    }
+    const char *v = json_string_value(json_object_get(yt, "version"));
+    char *out = v ? dlm_xstrdup(v) : NULL;
+    json_decref(root);
+    return out;
+}
+
 /* ---- public entry points ---------------------------------------------- */
 
 int dlm_tools_ensure_ready(int allow_network)
@@ -526,15 +760,11 @@ int dlm_tools_ensure_ready(int allow_network)
     /* re-check under the lock (another process may have just fetched) */
     if (need_ytdlp && !tool_present("yt-dlp")) {
         if (download_ytdlp() == 0) {
-            char ver[64];
-            json_t *root = load_state();
-            json_t *yt = json_object_get(root, "ytdlp");
-            if (!json_is_object(yt)) { yt = json_object(); json_object_set_new(root, "ytdlp", yt); }
-            if (latest_ytdlp_version(ver, sizeof ver) == 0)
-                json_object_set_new(yt, "version", json_string(ver));
-            json_object_set_new(yt, "installed_at", json_integer((json_int_t)time(NULL)));
-            save_state(root);
-            json_decref(root);
+            struct ytdlp_install ins;
+            memset(&ins, 0, sizeof ins);
+            ins.version = latest_ytdlp_version(ins.vbuf, sizeof ins.vbuf) == 0 ? ins.vbuf : NULL;
+            ins.when = time(NULL);
+            state_update(apply_ytdlp_install, &ins); /* network done before locking */
         }
     }
     if (need_ffmpeg && (!tool_present("ffmpeg") || !tool_present("ffprobe")))
@@ -548,45 +778,50 @@ int dlm_tools_check_updates(int force)
 {
     if (!dlm_tools_auto_enabled()) return 0;
 
-    json_t *root = load_state();
-    json_t *yt = json_object_get(root, "ytdlp");
-    if (!json_is_object(yt)) { yt = json_object(); json_object_set_new(root, "ytdlp", yt); }
-
+    /* Snapshot state, then do network I/O with no state lock held; the final
+     * write is a separate atomic load-modify-save, so concurrent callers can
+     * never clobber each other's fields. */
     json_int_t last = 0;
-    json_t *lc = json_object_get(yt, "last_check");
-    if (json_is_integer(lc)) last = json_integer_value(lc);
+    char *cur = recorded_ytdlp(&last);
     time_t now = time(NULL);
-    if (!force && last && (now - (time_t)last) < WEEK_SECONDS) { json_decref(root); return 0; }
+    if (!force && last && (now - (time_t)last) < WEEK_SECONDS) { free(cur); return 0; }
+
+    struct ytdlp_install ins;
+    memset(&ins, 0, sizeof ins);
+    ins.last_check = now;
 
     char latest[64];
     if (latest_ytdlp_version(latest, sizeof latest) != 0) {
         DLM_WARN("tools: could not check yt-dlp version");
         /* still record the attempt so we don't hammer the API */
-        json_object_set_new(yt, "last_check", json_integer((json_int_t)now));
-        save_state(root);
-        json_decref(root);
+        state_update(apply_last_check, &ins);
+        free(cur);
         return 0;
     }
 
-    const char *cur = json_string_value(json_object_get(yt, "version"));
     char managed[1024];
     managed_path("yt-dlp", managed, sizeof managed);
-    int have_managed = file_exists(managed);
-    int outdated = !cur || !have_managed || strcmp(cur, latest) != 0;
+    int outdated = !cur || !file_exists(managed) || strcmp(cur, latest) != 0;
+    free(cur);
 
-    if (outdated) {
-        if (lock_acquire() == 0) {
+    if (outdated && lock_acquire() == 0) {
+        /* re-check under the tools lock: another thread/process may have just
+         * installed this version while we were waiting */
+        char *again = recorded_ytdlp(NULL);
+        int still = !again || !file_exists(managed) || strcmp(again, latest) != 0;
+        free(again);
+        if (still) {
             DLM_INFO("tools: updating yt-dlp -> %s", latest);
             if (download_ytdlp() == 0) {
-                json_object_set_new(yt, "version", json_string(latest));
-                json_object_set_new(yt, "installed_at", json_integer((json_int_t)now));
+                snprintf(ins.vbuf, sizeof ins.vbuf, "%s", latest);
+                ins.version = ins.vbuf;
+                ins.when = now;
+                ins.installed = 1;
             }
-            lock_release();
         }
+        lock_release();
     }
-    json_object_set_new(yt, "last_check", json_integer((json_int_t)now));
-    save_state(root);
-    json_decref(root);
+    state_update(ins.installed ? apply_ytdlp_install : apply_last_check, &ins);
     return 0;
 }
 

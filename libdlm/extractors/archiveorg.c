@@ -146,16 +146,13 @@ static char *url_encode_path(const char *s)
 static char *basename_of(const char *path)
 {
     const char *slash = strrchr(path, '/');
-    char *out = dlm_xstrdup(slash ? slash + 1 : path);
-    /* The IA metadata 'name' is server-controlled; neutralise separators,
-     * control chars and a leading '.'/'-' so it can't traverse out of the
-     * target dir or look like a CLI option (mirrors ytdlp.c sanitize_filename). */
-    for (char *p = out; *p; p++)
-        if (*p == '/' || *p == '\\' || *p == ':' || (unsigned char)*p < 0x20)
-            *p = '_';
-    if (out[0] == '.' || out[0] == '-') out[0] = '_';
-    if (!out[0]) { free(out); out = dlm_xstrdup("download"); }
-    return out;
+    /* The IA metadata 'name' is server-controlled; dlm_sanitize_component
+     * neutralises separators, control chars, Windows-illegal characters,
+     * trailing dots/spaces, device names and a leading '.'/'-', so it can't
+     * traverse out of the target dir or look like a CLI option. Never empty.
+     * Basename collisions (same name in different subfolders) are resolved
+     * by the generic dedupe pass in extract.c. */
+    return dlm_sanitize_component(slash ? slash + 1 : path, 0);
 }
 
 static char **dup_headers(char *const *h)

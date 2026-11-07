@@ -253,6 +253,37 @@ int dlm_poll(struct dlm_pollfd *fds, unsigned n, int timeout_ms)
 /* shared by both: probe whether a server accepts connections */
 #endif
 
+int dlm_instance_lock(const char *sock_path)
+{
+    char path[512];
+    int n = snprintf(path, sizeof path, "%s.lock", sock_path);
+    if (n < 0 || (size_t)n >= sizeof path) return -1;
+#if defined(_WIN32)
+    /* share mode 0 = exclusive: a second CreateFile fails with
+     * ERROR_SHARING_VIOLATION while we hold the handle (closed by the OS on
+     * exit, even on a crash). */
+    HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_SHARING_VIOLATION ? 0 : -1;
+    return 1; /* intentionally kept open until process exit */
+#else
+    if (ensure_private_parent(sock_path) != 0) return -1;
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    struct flock fl;
+    memset(&fl, 0, sizeof fl);
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET; /* whole file (l_start = l_len = 0) */
+    if (fcntl(fd, F_SETLK, &fl) != 0) {
+        int busy = (errno == EACCES || errno == EAGAIN);
+        close(fd);
+        return busy ? 0 : -1;
+    }
+    return 1; /* fd intentionally kept open: the lock lives until exit */
+#endif
+}
+
 int dlm_unix_probe(const char *path)
 {
     dlm_sock_t fd = dlm_unix_connect(path);

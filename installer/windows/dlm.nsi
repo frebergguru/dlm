@@ -11,6 +11,7 @@ SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
 !include "x64.nsh"
+!include "LogicLib.nsh"
 
 !define APPNAME    "dlm"
 !define COMPANY    "dlm project"
@@ -19,20 +20,26 @@ SetCompressor /SOLID lzma
 Name "${APPNAME} ${VERSION}"
 OutFile "${OUTFILE}"
 RequestExecutionLevel admin       ; per-machine: Program Files + HKLM
-InstallDirRegKey HKLM "Software\dlm" "InstallDir"
+; The previous install dir is read from HKLM in .onInit, AFTER SetRegView 64
+; (an InstallDirRegKey attribute would be read before it, in the 32-bit view).
 
 !if "${ARCH64}" == "1"
-  InstallDir "$PROGRAMFILES64\dlm"
+  !define DEFAULT_INSTDIR "$PROGRAMFILES64\dlm"
 !else
-  InstallDir "$PROGRAMFILES\dlm"
+  !define DEFAULT_INSTDIR "$PROGRAMFILES\dlm"
 !endif
+InstallDir "${DEFAULT_INSTDIR}"
 
 ; ---- appearance ----------------------------------------------------------
 !define MUI_ICON   "${ICON}"
 !define MUI_UNICON "${ICON}"
 !define MUI_ABORTWARNING
-!define MUI_FINISHPAGE_RUN "$INSTDIR\bin\dlm-gui.exe"
+; The installer runs elevated; launching dlm-gui directly would run it (and
+; the dlmd it spawns) as administrator. Go through explorer.exe instead, which
+; starts it as the normal logged-in user.
+!define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_TEXT "Launch dlm now"
+!define MUI_FINISHPAGE_RUN_FUNCTION LaunchDlmAsUser
 
 ; ---- pages ---------------------------------------------------------------
 !insertmacro MUI_PAGE_WELCOME
@@ -47,6 +54,47 @@ InstallDirRegKey HKLM "Software\dlm" "InstallDir"
 
 !insertmacro MUI_LANGUAGE "English"
 
+; ---- helpers -------------------------------------------------------------
+; Stop a running dlm before files are replaced/removed (open .exe files can't
+; be overwritten on Windows). The GUI goes first, since it would respawn the
+; daemon; then ask the daemon to shut down cleanly ("dlm shutdown", which
+; checkpoints active downloads), wait for it, and only then force-kill what is
+; left (e.g. a daemon owned by another user, which "dlm shutdown" can't reach).
+!macro StopDlm
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /IM dlm-gui.exe'
+  Pop $0
+  Sleep 1000
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM dlm-gui.exe'
+  Pop $0
+  ${If} ${FileExists} "$INSTDIR\bin\dlm.exe"
+    nsExec::Exec '"$INSTDIR\bin\dlm.exe" shutdown'
+    Pop $0
+  ${EndIf}
+  StrCpy $1 0
+  ${Do}
+    ; exit code 0 = a dlmd.exe process is still listed
+    ; (the command after /C must not start with a quote: cmd would strip it)
+    nsExec::Exec '"$SYSDIR\cmd.exe" /C tasklist /NH /FI "IMAGENAME eq dlmd.exe" | find /I "dlmd.exe"'
+    Pop $0
+    ${If} $0 != 0
+      ${Break}
+    ${EndIf}
+    IntOp $1 $1 + 1
+    ${If} $1 >= 20
+      ${Break}
+    ${EndIf}
+    Sleep 500
+  ${Loop}
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM dlmd.exe'
+  Pop $0
+  Sleep 500
+!macroend
+
+Function LaunchDlmAsUser
+  SetOutPath "$INSTDIR\bin"
+  Exec '"$WINDIR\explorer.exe" "$INSTDIR\bin\dlm-gui.exe"'
+FunctionEnd
+
 ; ---- install -------------------------------------------------------------
 Function .onInit
   !if "${ARCH64}" == "1"
@@ -56,10 +104,30 @@ Function .onInit
     ${EndIf}
     SetRegView 64
   !endif
+  ; per-machine install: shortcuts go to the all-users Start Menu / Desktop
+  SetShellVarContext all
+  ; upgrade: reuse the previous install dir, unless /D= was given
+  ${If} $INSTDIR == "${DEFAULT_INSTDIR}"
+    ReadRegStr $0 HKLM "Software\dlm" "InstallDir"
+    ${If} $0 != ""
+      StrCpy $INSTDIR $0
+    ${EndIf}
+  ${EndIf}
 FunctionEnd
 
 Section "dlm (required)" SecCore
   SectionIn RO
+  !insertmacro StopDlm
+
+  ; older installers put the shortcuts in the installing admin's own profile;
+  ; remove those so an upgrade doesn't leave duplicates behind
+  SetShellVarContext current
+  Delete "$DESKTOP\dlm.lnk"
+  Delete "$SMPROGRAMS\dlm\dlm.lnk"
+  Delete "$SMPROGRAMS\dlm\Uninstall dlm.lnk"
+  RMDir  "$SMPROGRAMS\dlm"
+  SetShellVarContext all
+
   SetOutPath "$INSTDIR"
   File /r "${STAGE}\*"
 
@@ -103,9 +171,20 @@ Function un.onInit
   !if "${ARCH64}" == "1"
     SetRegView 64
   !endif
+  SetShellVarContext all
 FunctionEnd
 
 Section "Uninstall"
+  !insertmacro StopDlm
+
+  ; shortcuts from older (per-user) installs, then the all-users ones
+  SetShellVarContext current
+  Delete "$DESKTOP\dlm.lnk"
+  Delete "$SMPROGRAMS\dlm\dlm.lnk"
+  Delete "$SMPROGRAMS\dlm\Uninstall dlm.lnk"
+  RMDir  "$SMPROGRAMS\dlm"
+  SetShellVarContext all
+
   Delete "$DESKTOP\dlm.lnk"
   Delete "$SMPROGRAMS\dlm\dlm.lnk"
   Delete "$SMPROGRAMS\dlm\Uninstall dlm.lnk"

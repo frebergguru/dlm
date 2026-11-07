@@ -41,6 +41,12 @@ int dlm_extract(const char *url, dlm_extract_result *out);
 
 void dlm_extract_result_free(dlm_extract_result *r);
 
+/* Make task filenames unique within a result, comparing case-insensitively
+ * (Windows/macOS file systems): a later duplicate of an earlier name becomes
+ * "stem (2).ext", "stem (3).ext", ... Non-colliding names are left unchanged.
+ * dlm_extract() already applies this; exposed for callers/tests. */
+void dlm_extract_dedupe_names(dlm_extract_result *r);
+
 /* True if this URL is handled by the native archive.org extractor. */
 int dlm_is_archiveorg_url(const char *url);
 

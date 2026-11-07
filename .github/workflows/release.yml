@@ -30,9 +30,15 @@ jobs:
             libpcre2-dev libssl-dev libgtk-4-dev libadwaita-1-dev \
             wget ca-certificates file patchelf desktop-file-utils \
             librsvg2-bin libglib2.0-bin libgdk-pixbuf2.0-bin
+      - name: Check tag matches the CMake project version
+        run: ./installer/check-version.sh
       - name: Build AppImage
+        # The script strips every bundled ELF, runs check-stripped.sh and
+        # exits non-zero (failing this job) if anything is unstripped or the
+        # version does not match CMakeLists.txt.
         run: |
-          export VERSION="${GITHUB_REF_NAME#v}"
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = tag ]; then export VERSION="${GITHUB_REF_NAME#v}"; fi
           ./installer/appimage/build-appimage.sh
       - uses: actions/upload-artifact@v7
         with:
@@ -45,9 +51,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - name: Check tag matches the CMake project version
+        run: ./installer/check-version.sh
       - name: Build Windows installers (Docker)
+        # build.sh strips every exe/DLL and runs check-stripped.sh on the
+        # staging dir before makensis; any failure fails this job.
         run: |
-          export VERSION="${GITHUB_REF_NAME#v}"
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = tag ]; then export VERSION="${GITHUB_REF_NAME#v}"; fi
           ./build-win.sh
       - uses: actions/upload-artifact@v7
         with:
@@ -61,14 +72,30 @@ jobs:
     runs-on: ubuntu-24.04
     if: github.ref_type == 'tag'      # only publish for an actual version tag
     steps:
+      - uses: actions/checkout@v7      # for check-stripped.sh / check-version.sh
+      - name: Check tag matches the CMake project version
+        run: ./installer/check-version.sh
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
+      - name: Verify artifacts (version in file names, stripped)
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          files=(artifacts/appimage/*.AppImage artifacts/windows/*.exe)
+          for f in "${files[@]}"; do
+            case "$(basename "$f")" in
+              "dlm-$v-x86_64.AppImage"|"dlm-$v-setup-x64.exe"|"dlm-$v-setup-x86.exe") ;;
+              *) echo "unexpected artifact (wrong version?): $f" >&2; exit 1 ;;
+            esac
+          done
+          [ "${#files[@]}" -eq 3 ] || { echo "expected 3 artifacts, got ${#files[@]}" >&2; exit 1; }
+          bash ./check-stripped.sh "${files[@]}"
       - name: Create / update the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -e
+          set -euo pipefail
           files=(artifacts/appimage/*.AppImage artifacts/windows/*.exe)
           ls -lh "${files[@]}"
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \

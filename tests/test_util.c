@@ -64,6 +64,12 @@ int main(void)
     CHECK_RATE("1.5m", (int64_t)(1.5 * 1024 * 1024));
     CHECK_RATE("1g", (int64_t)1024 * 1024 * 1024);
     CHECK_RATE("garbage", 0);
+    CHECK_RATE("2X", 0);          /* unknown suffix: rejected, not "2 B/s" */
+    CHECK_RATE("5kx", 0);
+    CHECK_RATE("500KiB/s", 500 * 1024);
+    CHECK_RATE("2 MB", 2 * 1024 * 1024);
+    CHECK_RATE("1024b", 1024);
+    CHECK_RATE("1k/s", 1024);
 
     char rb[32];
     dlm_format_rate(0, rb, sizeof rb);

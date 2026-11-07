@@ -5,6 +5,10 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Single source of truth for the version: project() above. The code reports it
+# via DLM_VERSION_STR and the release scripts refuse a tag that differs.
+add_compile_definitions(DLM_VERSION_STR="${PROJECT_VERSION}")
+
 # Default to an optimized build. build.sh already passes Release explicitly;
 # this only affects a bare `cmake -B build` (which previously produced an
 # unoptimized -O0 Debug binary).
@@ -56,7 +60,9 @@ if(NOT DLM_ASAN)
     add_link_options(-s)
   endif()
 
-  # Opt-in host tuning (NOT for distributable binaries).
+  # Opt-in host tuning (NOT for distributable binaries). Default OFF; the
+  # release scripts (AppImage, Windows installers) pass -DDLM_NATIVE=OFF
+  # explicitly so a sticky cache value can never leak into a release.
   option(DLM_NATIVE "Tune codegen for the build host (-march=native)" OFF)
   if(DLM_NATIVE)
     check_c_compiler_flag("-march=native" DLM_HAS_MARCH_NATIVE)
@@ -174,11 +180,40 @@ endif()
 # optional systemd *user* service for dlmd (the daemon also auto-starts on
 # first client use, so this is a convenience): -DDLM_INSTALL_SYSTEMD=ON
 option(DLM_INSTALL_SYSTEMD "Install a systemd user service for dlmd" OFF)
+# Where the user unit goes. systemd only looks in fixed places, so this must NOT
+# follow CMAKE_INSTALL_LIBDIR (lib64 / multiarch dirs are never searched):
+#   prefix /usr             -> pkg-config systemd's systemduserunitdir
+#                              (fallback /usr/lib/systemd/user)
+#   prefix under $HOME      -> <prefix>/share/systemd/user (~/.local/share/...)
+#   any other prefix        -> <prefix>/lib/systemd/user (/usr/local/lib/...)
+# Override with -DDLM_SYSTEMD_USER_UNIT_DIR=<dir>.
+set(DLM_SYSTEMD_USER_UNIT_DIR "" CACHE STRING
+    "Override the systemd user unit install dir (empty = auto)")
 if(DLM_INSTALL_SYSTEMD)
   configure_file(packaging/dlm.service.in
                  ${CMAKE_BINARY_DIR}/dlm.service @ONLY)
-  install(FILES ${CMAKE_BINARY_DIR}/dlm.service
-          DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/user)
+  set(_dlm_unit_dir "${DLM_SYSTEMD_USER_UNIT_DIR}")
+  if(NOT _dlm_unit_dir)
+    get_filename_component(_dlm_prefix "${CMAKE_INSTALL_PREFIX}" ABSOLUTE)
+    set(_dlm_home "$ENV{HOME}")
+    string(LENGTH "${_dlm_home}/" _dlm_home_len)
+    string(SUBSTRING "${_dlm_prefix}/" 0 ${_dlm_home_len} _dlm_prefix_head)
+    if(_dlm_prefix STREQUAL "/usr")
+      pkg_get_variable(_dlm_pc_unit_dir systemd systemduserunitdir)
+      if(_dlm_pc_unit_dir)
+        set(_dlm_unit_dir "${_dlm_pc_unit_dir}")
+      else()
+        set(_dlm_unit_dir "lib/systemd/user")
+      endif()
+    elseif(_dlm_home AND NOT _dlm_home STREQUAL "/"
+           AND _dlm_prefix_head STREQUAL "${_dlm_home}/")
+      set(_dlm_unit_dir "share/systemd/user")
+    else()
+      set(_dlm_unit_dir "lib/systemd/user")
+    endif()
+  endif()
+  message(STATUS "systemd user unit: ${_dlm_unit_dir}")
+  install(FILES ${CMAKE_BINARY_DIR}/dlm.service DESTINATION "${_dlm_unit_dir}")
 endif()
 
 # ---- uninstall (cmake --build build --target uninstall) ------------------

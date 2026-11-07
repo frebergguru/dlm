@@ -26,7 +26,7 @@ RUN dnf -y --setopt=install_weak_deps=False install \
         mingw32-adwaita-icon-theme mingw64-adwaita-icon-theme \
         mingw32-nsis mingw64-nsis mingw-nsis-base \
         cmake ninja-build meson git sassc gettext glib2 glib2-devel \
-        librsvg2-tools icoutils file findutils which \
+        librsvg2-tools icoutils file findutils which python3 \
     && dnf clean all
 
 # Pin the libadwaita source revision compiled by build.sh (compatible with the

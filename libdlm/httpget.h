@@ -21,6 +21,13 @@ int dlm_http_get(const char *url, const char *const *headers, char **body,
 int dlm_http_get_blob(const char *url, const char *const *headers, char **body,
                       size_t *len, long *status);
 
+/* Background fetch of untrusted URLs (favicons and the like): GET with no
+ * extra headers, a body cap of max_bytes (0 = default 64 MiB), at most 5
+ * redirects, a 30 s overall timeout, and connections ONLY to public
+ * addresses — loopback, private, link-local etc. are refused on every hop. */
+int dlm_http_get_public(const char *url, char **body, size_t *len, long *status,
+                        size_t max_bytes);
+
 /* case-insensitive prefix test (returns 1 if `s` starts with `p`) */
 int dlm_ci_prefix(const char *s, const char *p);
 

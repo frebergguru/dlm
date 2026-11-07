@@ -95,6 +95,7 @@ typedef struct {
     const char *availability; /* "online"|"offline"|"unknown"; NULL => online */
 } dlm_grab_link;
 
+/* Returns NULL if the stored queue cannot be read completely. */
 dlm_queue *dlm_queue_create(dlm_store *store, int max_active);
 void dlm_queue_destroy(dlm_queue *q);
 

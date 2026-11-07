@@ -19,6 +19,18 @@
 #include <limits.h>
 #include <jansson.h>
 #include <string.h>
+#if !defined(_WIN32)
+#  include <sys/socket.h>
+#  include <sys/time.h>
+#endif
+
+/* Upper bound on one subscribe-stream line (same as DLM_LINE_MAX in
+ * cli/client.c): a peer that never sends '\n' must not grow the buffer forever. */
+#define GUI_LINE_MAX (16u * 1024 * 1024)
+
+/* Send/receive timeout on the GUI's own daemon sockets, so a hung daemon can't
+ * wedge a worker thread forever. */
+#define RPC_TIMEOUT_S 10
 
 /* Watch a (possibly Winsock) socket fd within the GLib main loop. g_unix_fd_add
  * is POSIX-only, so we go through a GIOChannel, which has a Win32-socket
@@ -41,6 +53,8 @@ int dlm_http_get_blob(const char *url, const char *const *headers, char **body,
                       size_t *len, long *status);
 int dlm_http_get(const char *url, const char *const *headers, char **body,
                  long *status);
+int dlm_http_get_public(const char *url, char **body, size_t *len, long *status,
+                        size_t max_bytes);
 int dlm_ci_prefix(const char *s, const char *p);
 
 /* How the linkgrabber groups links. */
@@ -108,6 +122,14 @@ typedef struct {
     GtkWidget *spinner;     /* global activity spinner (header) */
     AdwBanner *banner;      /* inline "Resolving…" banner */
     int resolving;          /* in-flight URL resolves */
+    guint reconnect_id;     /* pending reconnect timer (0 = none) */
+    int connecting;         /* a subscribe connect is running in a worker */
+    int stale;              /* disconnected: the lists show old data */
+    GtkWidget *ia_btn;      /* header archive.org button (insensitive while signing in) */
+    int ia_busy;            /* archive.org password login in flight */
+    int settings_pending;   /* settings query in flight (don't open twice) */
+    char *clip_offered;     /* link currently offered by the focus-grab toast */
+    AdwToast *offer_toast;  /* that toast while it is shown (not owned) */
 } App;
 
 static App g_app;
@@ -124,17 +146,179 @@ static void human(double n, char *buf, size_t len)
 
 static void toast(App *a, const char *msg)
 {
-    adw_toast_overlay_add_toast(a->toast, adw_toast_new(msg));
+    if (!a->toast) return;                    /* window already gone */
+    AdwToast *t = adw_toast_new(msg);
+    /* the clipboard offer stays up until acted on; don't let it queue every
+     * other message behind it — show this one now and bring the offer back */
+    if (a->offer_toast) adw_toast_set_priority(t, ADW_TOAST_PRIORITY_HIGH);
+    adw_toast_overlay_add_toast(a->toast, t);
 }
 
-/* open a short connection, send one command, ignore the reply */
+/* Give an (icon-only) widget a name screen readers announce. */
+static void set_a11y_label(GtkWidget *w, const char *label)
+{
+    gtk_accessible_update_property(GTK_ACCESSIBLE(w),
+                                   GTK_ACCESSIBLE_PROPERTY_LABEL, label, -1);
+}
+
+/* Point a control's accessible name at a visible label. */
+static void set_labelled_by(GtkWidget *w, GtkWidget *label)
+{
+    gtk_accessible_update_relation(GTK_ACCESSIBLE(w),
+                                   GTK_ACCESSIBLE_RELATION_LABELLED_BY, label, NULL, -1);
+}
+
+/* ---- daemon round-trips off the UI thread ----------------------------- */
+
+/* Bound every blocking send/recv on a socket we own (POSIX + Winsock). */
+static void rpc_set_timeouts(int fd)
+{
+#if defined(_WIN32)
+    DWORD ms = RPC_TIMEOUT_S * 1000;
+    setsockopt((SOCKET)fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ms, sizeof ms);
+    setsockopt((SOCKET)fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&ms, sizeof ms);
+#else
+    struct timeval tv;
+    tv.tv_sec = RPC_TIMEOUT_S;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+#endif
+}
+
+/* dlm_client_connect() may spawn dlmd; serialise it across worker threads so
+ * two threads can't start two daemons at once (it used to be serialised by
+ * running only on the main thread). */
+static GMutex connect_lock;
+static int locked_connect(void)
+{
+    g_mutex_lock(&connect_lock);
+    int fd = dlm_client_connect();
+    g_mutex_unlock(&connect_lock);
+    if (fd >= 0) rpc_set_timeouts(fd);
+    return fd;
+}
+
+/* A batch of one-shot commands, run in order on one dedicated worker thread
+ * (so commands still reach the daemon in the order the user issued them), with
+ * the outcome handed back to the main thread. The worker touches only the job,
+ * never GTK or g_app. */
+typedef struct CmdJob CmdJob;
+struct CmdJob {
+    GPtrArray *cmds;        /* JSON request strings (g_free) */
+    char *mkdir;            /* optional: directory to create first */
+    char *ok_toast;         /* toast shown once the daemon answered */
+    int quiet;              /* no "Cannot reach daemon" toast */
+    void (*done)(CmdJob *); /* optional main-thread completion */
+    gpointer user;
+    GDestroyNotify user_free;
+    /* results, written by the worker */
+    int connected;
+    int mkdir_errno;
+    int nok;                /* commands that got a reply */
+    GPtrArray *resps;       /* reply per command (g_free; NULL = none) */
+};
+
+static GAsyncQueue *cmd_queue;
+
+static CmdJob *cmd_job_new(void)
+{
+    CmdJob *j = g_new0(CmdJob, 1);
+    j->cmds = g_ptr_array_new_with_free_func(g_free);
+    j->resps = g_ptr_array_new_with_free_func(g_free);
+    return j;
+}
+
+static void cmd_job_add(CmdJob *j, const char *json)
+{
+    g_ptr_array_add(j->cmds, g_strdup(json));
+}
+
+static void cmd_job_free(CmdJob *j)
+{
+    g_ptr_array_unref(j->cmds);
+    g_ptr_array_unref(j->resps);
+    g_free(j->mkdir);
+    g_free(j->ok_toast);
+    if (j->user_free) j->user_free(j->user);
+    g_free(j);
+}
+
+static void cmd_job_run(CmdJob *j)
+{
+    if (j->mkdir && g_mkdir_with_parents(j->mkdir, 0755) != 0) {
+        j->mkdir_errno = errno ? errno : EIO;
+        return;
+    }
+    int fd = -1;
+    for (guint i = 0; i < j->cmds->len; i++) {
+        if (fd < 0) {
+            fd = locked_connect();
+            if (fd < 0) break;          /* daemon unreachable: stop here */
+            j->connected = 1;
+        }
+        char *resp = dlm_client_rpc(fd, g_ptr_array_index(j->cmds, i));
+        g_ptr_array_add(j->resps, resp ? g_strdup(resp) : NULL);
+        if (resp) j->nok++;
+        else { dlm_client_close(fd); fd = -1; } /* desynced/timed out: fresh conn */
+        free(resp);
+    }
+    if (fd >= 0) dlm_client_close(fd);
+}
+
+static gboolean cmd_job_finish(gpointer p)
+{
+    CmdJob *j = p;
+    App *a = &g_app;
+    if (a->win) {
+        if (j->mkdir_errno) {
+            char *msg = g_strdup_printf("Cannot create folder %s: %s", j->mkdir,
+                                        g_strerror(j->mkdir_errno));
+            toast(a, msg);
+            g_free(msg);
+        } else if (!j->connected && j->cmds->len) {
+            if (!j->quiet) toast(a, "Cannot reach daemon");
+        } else if (j->ok_toast) {
+            toast(a, j->ok_toast);
+        }
+    }
+    if (j->done) j->done(j);            /* checks g_app.win itself */
+    cmd_job_free(j);
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer cmd_thread_main(gpointer q)
+{
+    for (;;) {
+        CmdJob *j = g_async_queue_pop(q);
+        cmd_job_run(j);
+        g_idle_add(cmd_job_finish, j);
+    }
+    return NULL;
+}
+
+static void cmd_submit(CmdJob *j)
+{
+    if (!cmd_queue) {
+        cmd_queue = g_async_queue_new();
+        g_thread_unref(g_thread_new("dlm-cmd", cmd_thread_main, cmd_queue));
+    }
+    g_async_queue_push(cmd_queue, j);
+}
+
+/* send one command (in the background), toasting `ok` once it was delivered */
+static void send_cmd_toast(const char *json, const char *ok)
+{
+    CmdJob *j = cmd_job_new();
+    cmd_job_add(j, json);
+    j->ok_toast = g_strdup(ok);
+    cmd_submit(j);
+}
+
+/* send one command in the background, ignore the reply */
 static void send_cmd(const char *json)
 {
-    int fd = dlm_client_connect();
-    if (fd < 0) { toast(&g_app, "Cannot reach daemon"); return; }
-    char *resp = dlm_client_rpc(fd, json);
-    free(resp);
-    dlm_client_close(fd);
+    send_cmd_toast(json, NULL);
 }
 
 /* ---- generic, parameterized row/package action ----------------------- */
@@ -195,6 +379,7 @@ static GtkWidget *quick_btn(const char *icon, const char *tip, ActionCtx tmpl)
 {
     GtkWidget *b = gtk_button_new_from_icon_name(icon);
     gtk_widget_set_tooltip_text(b, tip);
+    set_a11y_label(b, tip);
     gtk_widget_add_css_class(b, "flat");
     gtk_widget_set_valign(b, GTK_ALIGN_CENTER);
     ActionCtx *c = g_new0(ActionCtx, 1);
@@ -264,6 +449,9 @@ static GtkWidget *menu_button(GtkWidget **box_out, GtkPopover **pop_out)
     GtkWidget *mb = gtk_menu_button_new();
     gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(mb), "view-more-symbolic");
     gtk_widget_add_css_class(mb, "flat");
+    gtk_widget_set_tooltip_text(mb, "More actions");
+    set_a11y_label(mb, "More actions");
+    g_object_set_data(G_OBJECT(mb), "dlm-ctl", (gpointer)"menu");
     GtkWidget *pop = gtk_popover_new();
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     gtk_widget_set_margin_top(box, 6); gtk_widget_set_margin_bottom(box, 6);
@@ -358,6 +546,15 @@ static const char *site_label(const char *host)
 
 /* host -> state: GINT 1 = fetch in flight, 2 = gave up (no usable icon). */
 static GHashTable *favicon_state;
+/* host -> GdkTexture: decoded icons, so rebuilds don't re-decode (main thread). */
+static GHashTable *favicon_tex;
+
+/* Remote favicon limits: a body larger than this is refused outright, images
+ * with a side above FAVICON_MAX_SIDE are refused, anything above
+ * FAVICON_CACHE_SIDE is scaled down before it is cached. */
+#define FAVICON_MAX_BYTES (1024 * 1024)
+#define FAVICON_MAX_SIDE 2048
+#define FAVICON_CACHE_SIDE 64
 
 static char *favicon_cache_path(const char *host)
 {
@@ -367,35 +564,83 @@ static char *favicon_cache_path(const char *host)
         safe[i++] = (g_ascii_isalnum(*p) || *p == '.' || *p == '-') ? *p : '_';
     safe[i] = '\0';
     char *dir = g_build_filename(g_get_user_cache_dir(), "dlm", "favicons", NULL);
-    char *path = g_strdup_printf("%s/%s.ico", dir, safe);
+    /* small re-encoded PNG (see favicon_save), not the raw remote bytes */
+    char *path = g_strdup_printf("%s/%s.png", dir, safe);
     g_free(dir);
     return path;
 }
 
-/* Fetch `url` and, if it is a real image, store it as the cached favicon for
- * `host`. Validating the bytes (not just the 200) lets us fall through to the
- * HTML <link rel="icon"> when a site answers /favicon.ico with a soft-404
- * HTML page. */
+typedef struct { int abort; } FavSize;
+
+/* Called once the image header is parsed: refuse absurd dimensions and ask the
+ * loader for a small rendition of big ones (SVG/ICO honour this directly). */
+static void favicon_size_prepared(GdkPixbufLoader *l, int w, int h, gpointer user)
+{
+    FavSize *fs = user;
+    if (w <= 0 || h <= 0 || w > FAVICON_MAX_SIDE || h > FAVICON_MAX_SIDE) {
+        fs->abort = 1;
+        gdk_pixbuf_loader_set_size(l, 1, 1);
+        return;
+    }
+    if (w > FAVICON_CACHE_SIDE || h > FAVICON_CACHE_SIDE) {
+        int nw = w >= h ? FAVICON_CACHE_SIDE : MAX(1, w * FAVICON_CACHE_SIDE / h);
+        int nh = h >= w ? FAVICON_CACHE_SIDE : MAX(1, h * FAVICON_CACHE_SIDE / w);
+        gdk_pixbuf_loader_set_size(l, nw, nh);
+    }
+}
+
+/* Fetch `url` and, if it is a real image, store a small PNG rendition as the
+ * cached favicon for `host`. Validating the bytes (not just the 200) lets us
+ * fall through to the HTML <link rel="icon"> when a site answers /favicon.ico
+ * with a soft-404 HTML page. Runs in a worker thread. */
 static gboolean favicon_save(const char *url, const char *host)
 {
     char *body = NULL; size_t len = 0; long st = 0;
     gboolean ok = FALSE;
-    if (dlm_http_get_blob(url, NULL, &body, &len, &st) == 0 &&
-        st >= 200 && st < 300 && len > 0) {
-        GInputStream *mem = g_memory_input_stream_new_from_data(body, len, NULL);
-        GdkPixbuf *pb = gdk_pixbuf_new_from_stream(mem, NULL, NULL);
-        g_object_unref(mem);
-        if (pb) {
-            g_object_unref(pb);
+    if (dlm_http_get_public(url, &body, &len, &st, FAVICON_MAX_BYTES) != 0 ||
+        st < 200 || st >= 300 || len == 0 || len > FAVICON_MAX_BYTES) {
+        g_free(body);
+        return FALSE;
+    }
+
+    FavSize fs = {0};
+    GdkPixbufLoader *l = gdk_pixbuf_loader_new();
+    g_signal_connect(l, "size-prepared", G_CALLBACK(favicon_size_prepared), &fs);
+    /* feed in chunks so an oversized image is abandoned right after its header */
+    gboolean fed = TRUE;
+    for (size_t off = 0; off < len && !fs.abort; ) {
+        size_t n = MIN((size_t)16384, len - off);
+        if (!gdk_pixbuf_loader_write(l, (const guchar *)body + off, n, NULL)) {
+            fed = FALSE;
+            break;
+        }
+        off += n;
+    }
+    gboolean closed = gdk_pixbuf_loader_close(l, NULL);
+    g_free(body);
+
+    GdkPixbuf *pb = (fed && closed && !fs.abort) ? gdk_pixbuf_loader_get_pixbuf(l) : NULL;
+    if (pb) {
+        int w = gdk_pixbuf_get_width(pb), h = gdk_pixbuf_get_height(pb);
+        GdkPixbuf *small = NULL;
+        if (w > FAVICON_CACHE_SIDE || h > FAVICON_CACHE_SIDE) {  /* loader ignored set_size */
+            int nw = w >= h ? FAVICON_CACHE_SIDE : MAX(1, w * FAVICON_CACHE_SIDE / h);
+            int nh = h >= w ? FAVICON_CACHE_SIDE : MAX(1, h * FAVICON_CACHE_SIDE / w);
+            small = gdk_pixbuf_scale_simple(pb, nw, nh, GDK_INTERP_BILINEAR);
+        }
+        gchar *png = NULL; gsize plen = 0;
+        if (gdk_pixbuf_save_to_buffer(small ? small : pb, &png, &plen, "png", NULL, NULL)) {
             char *path = favicon_cache_path(host);
             char *dir = g_path_get_dirname(path);
-            g_mkdir_with_parents(dir, 0700);
-            ok = g_file_set_contents(path, body, (gssize)len, NULL);
+            if (g_mkdir_with_parents(dir, 0700) == 0)
+                ok = g_file_set_contents(path, png, (gssize)plen, NULL);
             g_free(dir);
             g_free(path);
+            g_free(png);
         }
+        if (small) g_object_unref(small);
     }
-    g_free(body);
+    g_object_unref(l);
     return ok;
 }
 
@@ -415,8 +660,9 @@ static int favicon_sizes_score(const char *p, const char *end)
     if (g_strstr_len(v, q - v, "any")) return INT_MAX;
     int best = 0, n = 0;                        /* "32x32" / "16x16 32x32" -> 32 */
     for (const char *r = v; r < q; r++) {
-        if (*r >= '0' && *r <= '9') n = n * 10 + (*r - '0');
-        else { if (n > best) best = n; n = 0; }
+        if (*r >= '0' && *r <= '9') {
+            if (n <= 100000) n = n * 10 + (*r - '0');   /* cap: no signed overflow */
+        } else { if (n > best) best = n; n = 0; }
     }
     return n > best ? n : best;
 }
@@ -473,7 +719,123 @@ static char *favicon_resolve_url(const char *host, const char *href)
     return g_strdup_printf("https://%s/%s", host, href);   /* document-relative */
 }
 
-/* Worker thread: try /favicon.ico, then the page's <link rel="icon">. */
+/* ---- favicon URL policy (no SSRF via a page's <link rel="icon">) ------ */
+
+/* Host of an absolute http(s) URL, lower-cased, IPv6 brackets removed, trailing
+ * dot dropped. FALSE for other schemes or hosts with unexpected characters
+ * (percent-escapes, raw UTF-8 …), which are simply not fetched. */
+static gboolean icon_url_host(const char *url, char *buf, size_t len)
+{
+    const char *p;
+    if (dlm_ci_prefix(url, "http://")) p = url + 7;
+    else if (dlm_ci_prefix(url, "https://")) p = url + 8;
+    else return FALSE;
+    size_t auth = strcspn(p, "/?#\\");
+    const char *end = p + auth;
+    for (const char *q = p; q < end; q++)               /* drop user:pass@ */
+        if (*q == '@') p = q + 1;
+    size_t i = 0;
+    if (*p == '[') {                                    /* [IPv6] */
+        p++;
+        while (p < end && *p != ']' && i < len - 1) {
+            if (!g_ascii_isxdigit(*p) && *p != ':' && *p != '.') return FALSE;
+            buf[i++] = (char)g_ascii_tolower((guchar)*p++);
+        }
+        if (p >= end || *p != ']') return FALSE;
+    } else {
+        while (p < end && *p != ':' && i < len - 1) {
+            if (!g_ascii_isalnum(*p) && *p != '.' && *p != '-') return FALSE;
+            buf[i++] = (char)g_ascii_tolower((guchar)*p++);
+        }
+        if (p < end && *p != ':') return FALSE;         /* host too long */
+    }
+    buf[i] = '\0';
+    while (i > 0 && buf[i - 1] == '.') buf[--i] = '\0';
+    return i > 0;
+}
+
+/* Loopback, private, link-local, CGNAT, unspecified, multicast/reserved. */
+static gboolean ipv4_is_internal(const guint8 *b)
+{
+    return b[0] == 0 || b[0] == 10 || b[0] == 127 || b[0] >= 224 ||
+           (b[0] == 169 && b[1] == 254) ||
+           (b[0] == 172 && (b[1] & 0xf0) == 16) ||
+           (b[0] == 192 && b[1] == 168) ||
+           (b[0] == 100 && (b[1] & 0xc0) == 64);
+}
+
+/* TRUE if `host` names a public machine: not "localhost", not a single-label
+ * (search-domain) name, not a numeric host curl would read as an IPv4 address
+ * ("127.1", "2130706433", "0x7f000001"), and not an internal IP literal. */
+static gboolean host_is_public(const char *host)
+{
+    if (!*host || !strcmp(host, "localhost") || g_str_has_suffix(host, ".localhost"))
+        return FALSE;
+    GInetAddress *ia = g_inet_address_new_from_string(host);
+    if (ia) {
+        gboolean ok = TRUE;
+        const guint8 *b = g_inet_address_to_bytes(ia);
+        if (g_inet_address_get_family(ia) == G_SOCKET_FAMILY_IPV4) {
+            ok = !ipv4_is_internal(b);
+        } else {
+            static const guint8 v4map[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+            static const guint8 zero12[12] = {0};
+            if (g_inet_address_get_is_loopback(ia) || g_inet_address_get_is_any(ia) ||
+                (b[0] & 0xfe) == 0xfc ||                     /* fc00::/7 */
+                (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) ||   /* fe80::/10 */
+                (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0) ||   /* fec0::/10 */
+                b[0] == 0xff)                                /* multicast */
+                ok = FALSE;
+            else if (!memcmp(b, v4map, 12) || !memcmp(b, zero12, 12))
+                ok = !ipv4_is_internal(b + 12);              /* mapped/compat */
+        }
+        g_object_unref(ia);
+        return ok;
+    }
+    const char *last = strrchr(host, '.');
+    if (!last) return FALSE;                                 /* single label */
+    last++;
+    if (!*last || g_ascii_isdigit(*last)) return FALSE;      /* numeric TLD */
+    return TRUE;
+}
+
+/* Approximate registrable domain ("eTLD+1") without a public-suffix list: the
+ * last two labels, or three for the common "co.uk"/"com.au" style (a 2-letter
+ * ccTLD under a short second level). Returns a pointer into `host`. */
+static const char *reg_domain(const char *host)
+{
+    const char *d1 = strrchr(host, '.');
+    if (!d1) return host;
+    const char *d2 = d1;
+    while (d2 > host && d2[-1] != '.') d2--;                 /* start of SLD */
+    if (d2 == host) return host;                             /* only 2 labels */
+    size_t tld = strlen(d1 + 1), sld = (size_t)(d1 - d2);
+    if (tld == 2 && sld <= 3) {                              /* co.uk, com.au … */
+        const char *d3 = d2 - 1;
+        while (d3 > host && d3[-1] != '.') d3--;
+        return d3;
+    }
+    return d2;
+}
+
+/* May the favicon at `url` be fetched for a page on `page_host`? Only public
+ * http(s) hosts within the page's own registrable domain (the page host, a
+ * subdomain, a parent or a sibling); an IP-literal page only allows itself. */
+static gboolean favicon_url_allowed(const char *url, const char *page_host)
+{
+    char h[256];
+    if (!icon_url_host(url, h, sizeof h) || !host_is_public(h)) return FALSE;
+    if (!g_ascii_strcasecmp(h, page_host)) return TRUE;
+    GInetAddress *ia = g_inet_address_new_from_string(page_host);
+    if (ia) { g_object_unref(ia); return FALSE; }
+    GInetAddress *ib = g_inet_address_new_from_string(h);
+    if (ib) { g_object_unref(ib); return FALSE; }
+    return !g_ascii_strcasecmp(reg_domain(h), reg_domain(page_host));
+}
+
+/* Worker thread: try /favicon.ico, then the page's <link rel="icon"> (if that
+ * icon URL passes favicon_url_allowed; otherwise the /favicon.ico attempt above
+ * was the fallback and we give up). */
 static void favicon_worker(GTask *task, gpointer src, gpointer data, GCancellable *c)
 {
     (void)src; (void)c;
@@ -486,11 +848,14 @@ static void favicon_worker(GTask *task, gpointer src, gpointer data, GCancellabl
         char page[512];
         snprintf(page, sizeof page, "https://%s/", host);
         char *html = NULL; long st = 0;
-        if (dlm_http_get(page, NULL, &html, &st) == 0 && st >= 200 && st < 300 && html) {
+        if (dlm_http_get_public(page, &html, NULL, &st, 2 * 1024 * 1024) == 0 &&
+            st >= 200 && st < 300 && html) {
             char *href = favicon_href_from_html(html);
             if (href) {
                 char *iurl = favicon_resolve_url(host, href);
-                if (iurl) { ok = favicon_save(iurl, host); g_free(iurl); }
+                if (iurl && favicon_url_allowed(iurl, host))
+                    ok = favicon_save(iurl, host);
+                g_free(iurl);
                 g_free(href);
             }
         }
@@ -499,26 +864,32 @@ static void favicon_worker(GTask *task, gpointer src, gpointer data, GCancellabl
     g_task_return_boolean(task, ok);
 }
 
-/* Try to load the cached icon into `img`; returns FALSE if missing/unusable. */
+/* Try to load the cached icon into `img`; returns FALSE if missing/unusable.
+ * Decoded textures are kept per host, so a rebuild doesn't decode again. */
 static gboolean favicon_load(GtkImage *img, const char *host)
 {
-    char *path = favicon_cache_path(host);
-    gboolean ok = FALSE;
-    if (g_file_test(path, G_FILE_TEST_EXISTS)) {
-        /* GdkPixbuf handles .ico (and scaling) more reliably than GdkTexture */
-        GdkPixbuf *pb = gdk_pixbuf_new_from_file_at_size(path, 24, 24, NULL);
-        if (pb) {
+    if (!favicon_tex)
+        favicon_tex = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+                                            g_object_unref);
+    GdkTexture *tex = g_hash_table_lookup(favicon_tex, host);
+    if (!tex) {
+        char *path = favicon_cache_path(host);
+        if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+            /* GdkPixbuf handles scaling more reliably than GdkTexture */
+            GdkPixbuf *pb = gdk_pixbuf_new_from_file_at_size(path, 24, 24, NULL);
+            if (pb) {
 G_GNUC_BEGIN_IGNORE_DEPRECATIONS
-            GdkTexture *tex = gdk_texture_new_for_pixbuf(pb);
+                tex = gdk_texture_new_for_pixbuf(pb);
 G_GNUC_END_IGNORE_DEPRECATIONS
-            gtk_image_set_from_paintable(img, GDK_PAINTABLE(tex));
-            g_object_unref(tex);
-            g_object_unref(pb);
-            ok = TRUE;
+                g_object_unref(pb);
+                g_hash_table_replace(favicon_tex, g_strdup(host), tex);
+            }
         }
+        g_free(path);
     }
-    g_free(path);
-    return ok;
+    if (!tex) return FALSE;
+    gtk_image_set_from_paintable(img, GDK_PAINTABLE(tex));
+    return TRUE;
 }
 
 static void favicon_fetched(GObject *src, GAsyncResult *res, gpointer user)
@@ -527,6 +898,7 @@ static void favicon_fetched(GObject *src, GAsyncResult *res, gpointer user)
     GtkImage *img = GTK_IMAGE(user);            /* held with a ref until now */
     const char *host = g_object_get_data(G_OBJECT(img), "host");
     gboolean ok = g_task_propagate_boolean(G_TASK(res), NULL);
+    if (ok && favicon_tex) g_hash_table_remove(favicon_tex, host);  /* re-read */
     if (ok && favicon_load(img, host))
         g_hash_table_remove(favicon_state, host);                 /* cached now */
     else
@@ -594,6 +966,7 @@ static void on_site_confirm(GtkButton *b, gpointer user)
     const char *host = g_object_get_data(G_OBJECT(b), "host");
     if (!host) return;
     int n = 0;
+    CmdJob *j = cmd_job_new();       /* sent in order, off the UI thread */
     for (int i = 0; i < a->n; i++) {
         Dl *d = &a->items[i];
         if (!d->list || strcmp(d->list, "linkgrabber")) continue;
@@ -602,13 +975,12 @@ static void on_site_confirm(GtkButton *b, gpointer user)
         char cmd[128];
         snprintf(cmd, sizeof cmd,
                  "{\"cmd\":\"confirm\",\"id\":%lld,\"start\":true}", d->id);
-        send_cmd(cmd);
+        cmd_job_add(j, cmd);
         n++;
     }
-    char msg[96];
-    snprintf(msg, sizeof msg, "Confirmed %d link%s from %s", n,
-             n == 1 ? "" : "s", site_label(host));
-    toast(a, msg);
+    j->ok_toast = g_strdup_printf("Confirmed %d link%s from %s", n,
+                                  n == 1 ? "" : "s", site_label(host));
+    cmd_submit(j);
 }
 
 /* ---- shared styling: hierarchy bands + accent tint ------------------- *
@@ -649,6 +1021,27 @@ static GtkWidget *file_type_image(const char *name)
     return img;
 }
 
+/* Set a label's text only when it changed (no needless relayout/a11y churn). */
+static void set_label_if(GtkLabel *l, const char *text)
+{
+    if (l && g_strcmp0(gtk_label_get_text(l), text) != 0) gtk_label_set_text(l, text);
+}
+
+/* Accessible name + description for a list row (name stays, description is
+ * the live status line). */
+static void row_a11y(GtkWidget *row, const char *name, const char *desc)
+{
+    gtk_accessible_update_property(GTK_ACCESSIBLE(row),
+        GTK_ACCESSIBLE_PROPERTY_LABEL, name,
+        GTK_ACCESSIBLE_PROPERTY_DESCRIPTION, desc, -1);
+}
+
+static void site_sub_text(const char *host, int count, char *buf, size_t len)
+{
+    snprintf(buf, len, "%s · %d link%s",
+             host && *host ? host : "—", count, count == 1 ? "" : "s");
+}
+
 /* A site group header: favicon, friendly name, link count, collapse + confirm. */
 static GtkWidget *make_site_header(App *a, const char *host, int count,
                                    int linkgrabber)
@@ -668,6 +1061,8 @@ static GtkWidget *make_site_header(App *a, const char *host, int count,
         collapsed ? "pan-end-symbolic" : "pan-down-symbolic");
     gtk_widget_add_css_class(ct, "flat");
     gtk_widget_set_tooltip_text(ct, collapsed ? "Expand" : "Collapse");
+    set_a11y_label(ct, collapsed ? "Expand site" : "Collapse site");
+    g_object_set_data(G_OBJECT(ct), "dlm-ctl", (gpointer)"collapse");
     g_object_set_data_full(G_OBJECT(ct), "host", g_strdup(host), g_free);
     g_signal_connect(ct, "clicked", G_CALLBACK(on_site_collapse), a);
     gtk_box_append(GTK_BOX(outer), ct);
@@ -682,8 +1077,7 @@ static GtkWidget *make_site_header(App *a, const char *host, int count,
     gtk_widget_add_css_class(name, "heading");
     gtk_box_append(GTK_BOX(vbox), name);
     char sub[96];
-    snprintf(sub, sizeof sub, "%s · %d link%s",
-             host && *host ? host : "—", count, count == 1 ? "" : "s");
+    site_sub_text(host, count, sub, sizeof sub);
     GtkWidget *subl = gtk_label_new(sub);
     gtk_label_set_xalign(GTK_LABEL(subl), 0.0);
     gtk_label_set_ellipsize(GTK_LABEL(subl), PANGO_ELLIPSIZE_MIDDLE);
@@ -691,6 +1085,8 @@ static GtkWidget *make_site_header(App *a, const char *host, int count,
     gtk_widget_add_css_class(subl, "caption");
     gtk_box_append(GTK_BOX(vbox), subl);
     gtk_box_append(GTK_BOX(outer), vbox);
+    g_object_set_data(G_OBJECT(row), "dlm-sub", subl);
+    row_a11y(row, site_label(host), sub);
 
     if (linkgrabber) {
         GtkWidget *confirm = gtk_button_new_from_icon_name("object-select-symbolic");
@@ -698,6 +1094,8 @@ static GtkWidget *make_site_header(App *a, const char *host, int count,
         gtk_widget_add_css_class(confirm, "dlm-accent");
         gtk_widget_set_valign(confirm, GTK_ALIGN_CENTER);
         gtk_widget_set_tooltip_text(confirm, "Confirm all links from this site");
+        set_a11y_label(confirm, "Confirm all links from this site");
+        g_object_set_data(G_OBJECT(confirm), "dlm-ctl", (gpointer)"confirm");
         g_object_set_data_full(G_OBJECT(confirm), "host", g_strdup(host), g_free);
         g_signal_connect(confirm, "clicked", G_CALLBACK(on_site_confirm), a);
         gtk_box_append(GTK_BOX(outer), confirm);
@@ -705,6 +1103,74 @@ static GtkWidget *make_site_header(App *a, const char *host, int count,
 
     gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), outer);
     return row;
+}
+
+static void update_site_header(GtkWidget *row, const char *host, int count)
+{
+    char sub[96];
+    site_sub_text(host, count, sub, sizeof sub);
+    GtkLabel *subl = g_object_get_data(G_OBJECT(row), "dlm-sub");
+    if (subl && g_strcmp0(gtk_label_get_text(subl), sub) != 0) {
+        gtk_label_set_text(subl, sub);
+        row_a11y(row, site_label(host), sub);
+    }
+}
+
+/* Which state quick button a download row shows: 0 none, 1 Pause, 2 Resume,
+ * 3 Start now. Part of the row's structure signature. */
+static int quick_kind(const Dl *d)
+{
+    if (!d->state) return 0;
+    if (!strcmp(d->state, "active")) return 1;
+    if (!strcmp(d->state, "paused") || !strcmp(d->state, "error")) return 2;
+    if (!strcmp(d->state, "queued")) return 3;
+    return 0;
+}
+
+/* The row's status line ("active · 1.0 MiB / 2.0 MiB · …"). The state is
+ * always spelled out in text, never only by colour. */
+static void row_meta_text(const Dl *d, int linkgrabber, char *meta, size_t mlen)
+{
+    /* flags string: priority + disabled/manual/forced/offline */
+    char flags[96] = "";
+    const char *pt = "";
+    switch (d->priority) {
+    case 3: pt = "Highest"; break; case 2: pt = "Higher"; break;
+    case 1: pt = "High"; break; case -1: pt = "Low"; break;
+    case -2: pt = "Lower"; break; case -3: pt = "Lowest"; break;
+    }
+    if (*pt) { strncat(flags, " · prio ", sizeof flags - strlen(flags) - 1);
+               strncat(flags, pt, sizeof flags - strlen(flags) - 1); }
+    if (!d->enabled) strncat(flags, " · disabled", sizeof flags - strlen(flags) - 1);
+    if (!d->autostart) strncat(flags, " · manual", sizeof flags - strlen(flags) - 1);
+    if (d->force) strncat(flags, " · forced", sizeof flags - strlen(flags) - 1);
+
+    char db[24], tb[24], sb[24];
+    const char *state = d->state ? d->state : "?";
+    human((double)d->downloaded, db, sizeof db);
+    human((double)d->total, tb, sizeof tb);
+    human(d->speed, sb, sizeof sb);
+    if (linkgrabber) {
+        const char *av = d->availability ? d->availability : "unknown";
+        snprintf(meta, mlen, "%s · %s%s", av,
+                 d->total > 0 ? tb : "size unknown", flags);
+    } else if (!strcmp(state, "error") && d->error && *d->error) {
+        /* show why it failed (e.g. "HTTP 404 (file not found)") rather than a
+         * bare "error" the user can't act on */
+        snprintf(meta, mlen, "error · %s%s", d->error, flags);
+    } else if (d->total > 0 && d->speed > 1 && d->downloaded < d->total) {
+        long eta = (long)((double)(d->total - d->downloaded) / d->speed);
+        snprintf(meta, mlen, "%s · %s / %s · %s/s · ETA %ld:%02ld%s",
+                 state, db, tb, sb, eta / 60, eta % 60, flags);
+    } else {
+        snprintf(meta, mlen, "%s · %s / %s%s", state, db,
+                 d->total > 0 ? tb : "?", flags);
+    }
+}
+
+static double row_fraction(const Dl *d)
+{
+    return d->total > 0 ? (double)d->downloaded / (double)d->total : 0.0;
 }
 
 /* One download/linkgrabber link row, with all per-link queue actions. */
@@ -734,67 +1200,38 @@ static GtkWidget *make_row(Dl *d, int linkgrabber, int indent)
 
     if (!linkgrabber) {
         GtkWidget *bar = gtk_progress_bar_new();
-        double frac = d->total > 0 ? (double)d->downloaded / (double)d->total : 0.0;
-        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(bar), frac);
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(bar), row_fraction(d));
         if (d->state && !strcmp(d->state, "active"))
             gtk_widget_add_css_class(bar, "accent");
+        set_a11y_label(bar, "Download progress");
         gtk_box_append(GTK_BOX(vbox), bar);
+        g_object_set_data(G_OBJECT(row), "dlm-bar", bar);
     }
 
-    /* flags string: priority + disabled/manual/forced/offline */
-    char flags[96] = "";
-    const char *pt = "";
-    switch (d->priority) {
-    case 3: pt = "Highest"; break; case 2: pt = "Higher"; break;
-    case 1: pt = "High"; break; case -1: pt = "Low"; break;
-    case -2: pt = "Lower"; break; case -3: pt = "Lowest"; break;
-    }
-    if (*pt) { strncat(flags, " · prio ", sizeof flags - strlen(flags) - 1);
-               strncat(flags, pt, sizeof flags - strlen(flags) - 1); }
-    if (!d->enabled) strncat(flags, " · disabled", sizeof flags - strlen(flags) - 1);
-    if (!d->autostart) strncat(flags, " · manual", sizeof flags - strlen(flags) - 1);
-    if (d->force) strncat(flags, " · forced", sizeof flags - strlen(flags) - 1);
-
-    char db[24], tb[24], sb[24], meta[256];
-    const char *state = d->state ? d->state : "?";
-    human((double)d->downloaded, db, sizeof db);
-    human((double)d->total, tb, sizeof tb);
-    human(d->speed, sb, sizeof sb);
-    if (linkgrabber) {
-        const char *av = d->availability ? d->availability : "unknown";
-        snprintf(meta, sizeof meta, "%s · %s%s", av,
-                 d->total > 0 ? tb : "size unknown", flags);
-    } else if (!strcmp(state, "error") && d->error && *d->error) {
-        /* show why it failed (e.g. "HTTP 404 (file not found)") rather than a
-         * bare "error" the user can't act on */
-        snprintf(meta, sizeof meta, "error · %s%s", d->error, flags);
-    } else if (d->total > 0 && d->speed > 1 && d->downloaded < d->total) {
-        long eta = (long)((double)(d->total - d->downloaded) / d->speed);
-        snprintf(meta, sizeof meta, "%s · %s / %s · %s/s · ETA %ld:%02ld%s",
-                 state, db, tb, sb, eta / 60, eta % 60, flags);
-    } else {
-        snprintf(meta, sizeof meta, "%s · %s / %s%s", state, db,
-                 d->total > 0 ? tb : "?", flags);
-    }
+    char meta[256];
+    row_meta_text(d, linkgrabber, meta, sizeof meta);
     GtkWidget *ml = gtk_label_new(meta);
     gtk_label_set_xalign(GTK_LABEL(ml), 0.0);
     gtk_widget_add_css_class(ml, "dim-label");
     gtk_widget_add_css_class(ml, "caption");
     gtk_box_append(GTK_BOX(vbox), ml);
     gtk_box_append(GTK_BOX(outer), vbox);
+    g_object_set_data(G_OBJECT(row), "dlm-meta", ml);
+    row_a11y(row, d->name ? d->name : "", meta);
 
     /* right: quick buttons + ⋮ menu + remove */
     GtkWidget *btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     gtk_widget_set_valign(btns, GTK_ALIGN_CENTER);
     long long id = d->id;
 
-    GtkWidget *box, *mb;
+    GtkWidget *box, *mb, *qb = NULL;
     GtkPopover *pop;
 
     if (linkgrabber) {
         ActionCtx cf = ctx_make("confirm", id, 0); cf.startflag = 1;
-        gtk_box_append(GTK_BOX(btns),
-                       quick_btn("object-select-symbolic", "Confirm (start)", cf));
+        qb = quick_btn("object-select-symbolic", "Confirm (start)", cf);
+        g_object_set_data(G_OBJECT(qb), "dlm-ctl", (gpointer)"confirm");
+        gtk_box_append(GTK_BOX(btns), qb);
         mb = menu_button(&box, &pop);
         ActionCtx cn = ctx_make("confirm", id, 0); cn.startflag = 0;
         pop_add(box, pop, "Confirm (don't start)", cn);
@@ -802,18 +1239,22 @@ static GtkWidget *make_row(Dl *d, int linkgrabber, int indent)
         pop_add_move(box, pop, id, 0);
         gtk_box_append(GTK_BOX(btns), mb);
         ActionCtx rm = ctx_make("lg_remove", id, 0);
-        gtk_box_append(GTK_BOX(btns),
-                       quick_btn("user-trash-symbolic", "Remove from linkgrabber", rm));
+        qb = quick_btn("user-trash-symbolic", "Remove from linkgrabber", rm);
+        g_object_set_data(G_OBJECT(qb), "dlm-ctl", (gpointer)"remove");
+        gtk_box_append(GTK_BOX(btns), qb);
     } else {
-        if (d->state && !strcmp(d->state, "active")) {
-            gtk_box_append(GTK_BOX(btns),
-                quick_btn("media-playback-pause-symbolic", "Pause", ctx_make("pause", id, 0)));
-        } else if (d->state && (!strcmp(d->state, "paused") || !strcmp(d->state, "error"))) {
-            gtk_box_append(GTK_BOX(btns),
-                quick_btn("media-playback-start-symbolic", "Resume", ctx_make("resume", id, 0)));
-        } else if (d->state && !strcmp(d->state, "queued")) {
-            gtk_box_append(GTK_BOX(btns),
-                quick_btn("media-playback-start-symbolic", "Start now", ctx_make("force", id, 0)));
+        switch (quick_kind(d)) {
+        case 1: qb = quick_btn("media-playback-pause-symbolic", "Pause",
+                               ctx_make("pause", id, 0)); break;
+        case 2: qb = quick_btn("media-playback-start-symbolic", "Resume",
+                               ctx_make("resume", id, 0)); break;
+        case 3: qb = quick_btn("media-playback-start-symbolic", "Start now",
+                               ctx_make("force", id, 0)); break;
+        default: qb = NULL;
+        }
+        if (qb) {
+            g_object_set_data(G_OBJECT(qb), "dlm-ctl", (gpointer)"state");
+            gtk_box_append(GTK_BOX(btns), qb);
         }
         mb = menu_button(&box, &pop);
         pop_add(box, pop, "Start now (force)", ctx_make("force", id, 0));
@@ -826,13 +1267,37 @@ static GtkWidget *make_row(Dl *d, int linkgrabber, int indent)
         pop_sep(box);
         pop_add_move(box, pop, id, 0);
         gtk_box_append(GTK_BOX(btns), mb);
-        gtk_box_append(GTK_BOX(btns),
-                       quick_btn("user-trash-symbolic", "Remove", ctx_make("rm", id, 0)));
+        qb = quick_btn("user-trash-symbolic", "Remove", ctx_make("rm", id, 0));
+        g_object_set_data(G_OBJECT(qb), "dlm-ctl", (gpointer)"remove");
+        gtk_box_append(GTK_BOX(btns), qb);
     }
 
     gtk_box_append(GTK_BOX(outer), btns);
     gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), outer);
     return row;
+}
+
+/* In-place refresh of a link row whose structure is unchanged. */
+static void update_row(GtkWidget *row, Dl *d, int linkgrabber)
+{
+    GtkProgressBar *bar = g_object_get_data(G_OBJECT(row), "dlm-bar");
+    if (bar) {
+        double f = row_fraction(d);
+        if (gtk_progress_bar_get_fraction(bar) != f) gtk_progress_bar_set_fraction(bar, f);
+    }
+    char meta[256];
+    row_meta_text(d, linkgrabber, meta, sizeof meta);
+    GtkLabel *ml = g_object_get_data(G_OBJECT(row), "dlm-meta");
+    if (ml && g_strcmp0(gtk_label_get_text(ml), meta) != 0) {
+        gtk_label_set_text(ml, meta);
+        row_a11y(row, d->name ? d->name : "", meta);
+    }
+}
+
+static void pkg_sub_text(const Pkg *p, char *buf, size_t len)
+{
+    snprintf(buf, len, "%d link%s%s%s", p->links, p->links == 1 ? "" : "s",
+             p->folder ? " · " : "", p->folder ? p->folder : "");
 }
 
 /* A package header row with collapse + package-wide actions. */
@@ -854,9 +1319,11 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber, int indent)
     /* collapse/expand toggle */
     ActionCtx ce = ctx_make("pkg", p->id, 0);
     ce.collapsedflag = p->collapsed ? 0 : 1;
-    gtk_box_append(GTK_BOX(outer),
-        quick_btn(p->collapsed ? "pan-end-symbolic" : "pan-down-symbolic",
-                  p->collapsed ? "Expand" : "Collapse", ce));
+    GtkWidget *cbtn = quick_btn(p->collapsed ? "pan-end-symbolic" : "pan-down-symbolic",
+                                p->collapsed ? "Expand" : "Collapse", ce);
+    set_a11y_label(cbtn, p->collapsed ? "Expand package" : "Collapse package");
+    g_object_set_data(G_OBJECT(cbtn), "dlm-ctl", (gpointer)"collapse");
+    gtk_box_append(GTK_BOX(outer), cbtn);
 
     /* accent folder glyph marks a package, as on mobile */
     GtkWidget *folder = gtk_image_new_from_icon_name("folder-symbolic");
@@ -867,14 +1334,14 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber, int indent)
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     gtk_widget_set_hexpand(vbox, TRUE);
-    GtkWidget *name = gtk_label_new(p->name ? p->name : "package");
+    const char *pname = p->name ? p->name : "package";
+    GtkWidget *name = gtk_label_new(pname);
     gtk_label_set_xalign(GTK_LABEL(name), 0.0);
     gtk_label_set_ellipsize(GTK_LABEL(name), PANGO_ELLIPSIZE_MIDDLE);
     gtk_widget_add_css_class(name, "heading");
     gtk_box_append(GTK_BOX(vbox), name);
     char sub[400];
-    snprintf(sub, sizeof sub, "%d link%s%s%s", p->links, p->links == 1 ? "" : "s",
-             p->folder ? " · " : "", p->folder ? p->folder : "");
+    pkg_sub_text(p, sub, sizeof sub);
     GtkWidget *subl = gtk_label_new(sub);
     gtk_label_set_xalign(GTK_LABEL(subl), 0.0);
     gtk_label_set_ellipsize(GTK_LABEL(subl), PANGO_ELLIPSIZE_MIDDLE);
@@ -882,6 +1349,9 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber, int indent)
     gtk_widget_add_css_class(subl, "caption");
     gtk_box_append(GTK_BOX(vbox), subl);
     gtk_box_append(GTK_BOX(outer), vbox);
+    g_object_set_data(G_OBJECT(row), "dlm-name", name);
+    g_object_set_data(G_OBJECT(row), "dlm-sub", subl);
+    row_a11y(row, pname, sub);
 
     GtkWidget *btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     gtk_widget_set_valign(btns, GTK_ALIGN_CENTER);
@@ -891,6 +1361,7 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber, int indent)
         ActionCtx cf = ctx_make("confirm", id, 1); cf.startflag = 1;
         GtkWidget *cb = quick_btn("object-select-symbolic", "Confirm package", cf);
         gtk_widget_add_css_class(cb, "dlm-accent");
+        g_object_set_data(G_OBJECT(cb), "dlm-ctl", (gpointer)"confirm");
         gtk_box_append(GTK_BOX(btns), cb);
     }
 
@@ -947,6 +1418,38 @@ static GtkWidget *make_pkg_header(App *a, Pkg *p, int linkgrabber, int indent)
     return row;
 }
 
+static void update_pkg_header(GtkWidget *row, Pkg *p)
+{
+    const char *pname = p->name ? p->name : "package";
+    char sub[400];
+    pkg_sub_text(p, sub, sizeof sub);
+    GtkLabel *nl = g_object_get_data(G_OBJECT(row), "dlm-name");
+    GtkLabel *sl = g_object_get_data(G_OBJECT(row), "dlm-sub");
+    if ((nl && g_strcmp0(gtk_label_get_text(nl), pname) != 0) ||
+        (sl && g_strcmp0(gtk_label_get_text(sl), sub) != 0)) {
+        set_label_if(nl, pname);
+        set_label_if(sl, sub);
+        row_a11y(row, pname, sub);
+    }
+}
+
+/* The "nothing here" placeholder row. */
+static GtkWidget *make_empty_row(int linkgrabber)
+{
+    GtkWidget *empty = adw_status_page_new();
+    adw_status_page_set_icon_name(ADW_STATUS_PAGE(empty),
+        linkgrabber ? "edit-find-symbolic" : "folder-download-symbolic");
+    adw_status_page_set_title(ADW_STATUS_PAGE(empty),
+        linkgrabber ? "Linkgrabber empty" : "No downloads");
+    adw_status_page_set_description(ADW_STATUS_PAGE(empty),
+        linkgrabber ? "Use + → “Review in linkgrabber” to stage links."
+                    : "Click + to add a URL or archive.org item.");
+    GtkWidget *r = gtk_list_box_row_new();
+    gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(r), FALSE);
+    gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(r), empty);
+    return r;
+}
+
 /* True if `d` belongs to a package that lives in `view`. */
 static int item_has_pkg(App *a, Dl *d, const char *view)
 {
@@ -991,8 +1494,87 @@ static void item_host(App *a, Dl *d, char *buf, size_t len)
 /* One indent step (px) for nesting a package under its site header. */
 #define SITE_INDENT 24
 
+/* ---- row descriptors: rebuild only on structural change --------------- *
+ * Rendering first describes the rows a view should show. Each descriptor has a
+ * signature covering everything that shapes the row's widgets (id, kind,
+ * indent, collapse state, which buttons/menu entries it has). If the new list
+ * of signatures equals the one the list was built from, the existing rows are
+ * refreshed in place (labels, progress, accessible descriptions), so keyboard
+ * and screen-reader focus survive the 0.5 s progress events. Otherwise the list
+ * is rebuilt and focus is put back on the equivalent control. */
+enum { RD_SITE, RD_PKG, RD_ROW, RD_EMPTY };
+
+typedef struct {
+    int kind;
+    Dl *d;          /* RD_ROW */
+    Pkg *p;         /* RD_PKG */
+    char *host;     /* RD_SITE */
+    int count;      /* RD_SITE */
+    int indent;
+    char *key;      /* identity, for focus restore */
+    char *sig;      /* structure signature */
+} RowDesc;
+
+static void row_desc_clear(gpointer p)
+{
+    RowDesc *r = p;
+    g_free(r->host);
+    g_free(r->key);
+    g_free(r->sig);
+}
+
+static void desc_site(GArray *v, App *a, const char *host, int count, int lg)
+{
+    RowDesc r;
+    memset(&r, 0, sizeof r);
+    r.kind = RD_SITE;
+    r.host = g_strdup(host);
+    r.count = count;
+    r.key = g_strdup_printf("s|%s", host);
+    r.sig = g_strdup_printf("s|%s|%d|%d", host, site_collapsed(a, host), lg);
+    g_array_append_val(v, r);
+}
+
+static void desc_pkg(GArray *v, Pkg *p, int indent, int lg)
+{
+    RowDesc r;
+    memset(&r, 0, sizeof r);
+    r.kind = RD_PKG;
+    r.p = p;
+    r.indent = indent;
+    r.key = g_strdup_printf("p|%lld", p->id);
+    r.sig = g_strdup_printf("p|%lld|%d|%d|%d", p->id, p->collapsed, indent, lg);
+    g_array_append_val(v, r);
+}
+
+static void desc_row(GArray *v, Dl *d, int indent, int lg)
+{
+    RowDesc r;
+    memset(&r, 0, sizeof r);
+    r.kind = RD_ROW;
+    r.d = d;
+    r.indent = indent;
+    r.key = g_strdup_printf("r|%lld", d->id);
+    /* name drives the file-type icon; state kind/enabled/autostart drive the
+     * quick button, the bar's accent and the menu entries */
+    r.sig = g_strdup_printf("r|%lld|%d|%d|%d|%d|%d|%s", d->id, indent, lg,
+                            quick_kind(d), d->enabled, d->autostart,
+                            d->name ? d->name : "");
+    g_array_append_val(v, r);
+}
+
+static void desc_empty(GArray *v, int lg)
+{
+    RowDesc r;
+    memset(&r, 0, sizeof r);
+    r.kind = RD_EMPTY;
+    r.key = g_strdup("e");
+    r.sig = g_strdup_printf("e|%d", lg);
+    g_array_append_val(v, r);
+}
+
 /* Classic package grouping (used for the downloads view and "Packages" mode). */
-static int render_pkg_view(App *a, GtkListBox *list, const char *view,
+static int render_pkg_view(App *a, GArray *out, const char *view,
                            const char *filter, int linkgrabber)
 {
     int shown = 0;
@@ -1000,14 +1582,14 @@ static int render_pkg_view(App *a, GtkListBox *list, const char *view,
     for (int pi = 0; pi < a->npkg; pi++) {
         Pkg *p = &a->pkgs[pi];
         if (!p->list || strcmp(p->list, view)) continue;
-        gtk_list_box_append(list, make_pkg_header(a, p, linkgrabber, 0));
+        desc_pkg(out, p, 0, linkgrabber);
         shown++;
         if (p->collapsed) continue;
         for (int i = 0; i < a->n; i++) {
             Dl *d = &a->items[i];
             if (d->package_id != p->id || !d->list || strcmp(d->list, view)) continue;
             if (!linkgrabber && filter && (!d->state || strcmp(d->state, filter))) continue;
-            gtk_list_box_append(list, make_row(d, linkgrabber, 0));
+            desc_row(out, d, 0, linkgrabber);
         }
     }
     /* loose links (no package in this view) */
@@ -1016,7 +1598,7 @@ static int render_pkg_view(App *a, GtkListBox *list, const char *view,
         if (!d->list || strcmp(d->list, view)) continue;
         if (item_has_pkg(a, d, view)) continue;
         if (!linkgrabber && filter && (!d->state || strcmp(d->state, filter))) continue;
-        gtk_list_box_append(list, make_row(d, linkgrabber, 0));
+        desc_row(out, d, 0, linkgrabber);
         shown++;
     }
     return shown;
@@ -1031,7 +1613,7 @@ static int item_passes(Dl *d, const char *filter, int linkgrabber)
 
 /* Site grouping for either view. When `nested`, packages are shown under their
  * site header; otherwise links are listed directly under the site. */
-static int render_site_view(App *a, GtkListBox *list, const char *view,
+static int render_site_view(App *a, GArray *out, const char *view,
                             const char *filter, int linkgrabber, int nested)
 {
     /* unique hosts, in first-appearance order (only over visible links) */
@@ -1058,7 +1640,7 @@ static int render_site_view(App *a, GtkListBox *list, const char *view,
             char h[256]; item_host(a, d, h, sizeof h);
             if (!strcmp(h, host)) count++;
         }
-        gtk_list_box_append(list, make_site_header(a, host, count, linkgrabber));
+        desc_site(out, a, host, count, linkgrabber);
         shown++;
         if (site_collapsed(a, host)) continue;
 
@@ -1070,14 +1652,14 @@ static int render_site_view(App *a, GtkListBox *list, const char *view,
                 char ph[256]; pkg_host(a, p, view, ph, sizeof ph);
                 if (strcmp(ph, host)) continue;
                 /* nest the package (header + its files) under its site header */
-                gtk_list_box_append(list, make_pkg_header(a, p, linkgrabber, SITE_INDENT));
+                desc_pkg(out, p, SITE_INDENT, linkgrabber);
                 if (p->collapsed) continue;
                 for (int i = 0; i < a->n; i++) {
                     Dl *d = &a->items[i];
                     if (d->package_id != p->id || !d->list || strcmp(d->list, view))
                         continue;
                     if (!item_passes(d, filter, linkgrabber)) continue;
-                    gtk_list_box_append(list, make_row(d, linkgrabber, SITE_INDENT));
+                    desc_row(out, d, SITE_INDENT, linkgrabber);
                 }
             }
             /* loose links of this host (no package): stay at the site level */
@@ -1088,7 +1670,7 @@ static int render_site_view(App *a, GtkListBox *list, const char *view,
                 if (!item_passes(d, filter, linkgrabber)) continue;
                 char h[256]; item_host(a, d, h, sizeof h);
                 if (strcmp(h, host)) continue;
-                gtk_list_box_append(list, make_row(d, linkgrabber, 0));
+                desc_row(out, d, 0, linkgrabber);
             }
         } else {
             /* all links of this host, regardless of package */
@@ -1098,7 +1680,7 @@ static int render_site_view(App *a, GtkListBox *list, const char *view,
                 if (!item_passes(d, filter, linkgrabber)) continue;
                 char h[256]; item_host(a, d, h, sizeof h);
                 if (strcmp(h, host)) continue;
-                gtk_list_box_append(list, make_row(d, linkgrabber, 0));
+                desc_row(out, d, 0, linkgrabber);
             }
         }
     }
@@ -1106,39 +1688,116 @@ static int render_site_view(App *a, GtkListBox *list, const char *view,
     return shown;
 }
 
+/* First descendant of `w` tagged with dlm-ctl == ctl. */
+static GtkWidget *find_ctl(GtkWidget *w, const char *ctl)
+{
+    for (GtkWidget *c = gtk_widget_get_first_child(w); c; c = gtk_widget_get_next_sibling(c)) {
+        const char *t = g_object_get_data(G_OBJECT(c), "dlm-ctl");
+        if (t && !strcmp(t, ctl)) return c;
+        GtkWidget *r = find_ctl(c, ctl);
+        if (r) return r;
+    }
+    return NULL;
+}
+
 static void render_into(App *a, GtkListBox *list, const char *view,
                         const char *filter)
 {
+    int linkgrabber = !strcmp(view, "linkgrabber");
+    GArray *v = g_array_new(FALSE, TRUE, sizeof(RowDesc));
+    g_array_set_clear_func(v, row_desc_clear);
+    int shown;
+    if (a->group_mode != GROUP_PKG)
+        shown = render_site_view(a, v, view, filter, linkgrabber,
+                                 a->group_mode == GROUP_SITE_PKG);
+    else
+        shown = render_pkg_view(a, v, view, filter, linkgrabber);
+    if (shown == 0) desc_empty(v, linkgrabber);
+
+    /* same structure as last time? then refresh the existing rows in place */
+    GPtrArray *old = g_object_get_data(G_OBJECT(list), "dlm-sigs");
+    gboolean same = old && old->len == v->len;
+    for (guint i = 0; same && i < v->len; i++)
+        if (strcmp(g_ptr_array_index(old, i), g_array_index(v, RowDesc, i).sig))
+            same = FALSE;
+    if (same) {
+        GtkWidget *row = gtk_widget_get_first_child(GTK_WIDGET(list));
+        guint i = 0;
+        for (; i < v->len && row && GTK_IS_LIST_BOX_ROW(row);
+             i++, row = gtk_widget_get_next_sibling(row)) {
+            RowDesc *r = &g_array_index(v, RowDesc, i);
+            if (r->kind == RD_ROW) update_row(row, r->d, linkgrabber);
+            else if (r->kind == RD_PKG) update_pkg_header(row, r->p);
+            else if (r->kind == RD_SITE) update_site_header(row, r->host, r->count);
+        }
+        if (i == v->len && !row) { g_array_unref(v); return; }
+        /* widgets out of step with the signatures (shouldn't happen): rebuild */
+    }
+
+    /* remember where keyboard focus was, if it was inside this list */
+    char *fkey = NULL;
+    const char *fctl = NULL;   /* static strings only */
+    int fidx = -1;
+    GtkWidget *focus = a->win ? gtk_root_get_focus(GTK_ROOT(a->win)) : NULL;
+    if (focus && gtk_widget_is_ancestor(focus, GTK_WIDGET(list))) {
+        for (GtkWidget *w = focus; w && w != GTK_WIDGET(list); w = gtk_widget_get_parent(w)) {
+            if (!fctl) fctl = g_object_get_data(G_OBJECT(w), "dlm-ctl");
+            if (GTK_IS_LIST_BOX_ROW(w)) {
+                fkey = g_strdup(g_object_get_data(G_OBJECT(w), "dlm-key"));
+                fidx = gtk_list_box_row_get_index(GTK_LIST_BOX_ROW(w));
+                break;
+            }
+        }
+    }
+
     GtkWidget *child;
     while ((child = gtk_widget_get_first_child(GTK_WIDGET(list))))
         gtk_list_box_remove(list, child);
 
-    int linkgrabber = !strcmp(view, "linkgrabber");
-    int shown;
-    if (a->group_mode != GROUP_PKG)
-        shown = render_site_view(a, list, view, filter, linkgrabber,
-                                 a->group_mode == GROUP_SITE_PKG);
-    else
-        shown = render_pkg_view(a, list, view, filter, linkgrabber);
-
-    if (shown == 0) {
-        GtkWidget *empty = adw_status_page_new();
-        adw_status_page_set_icon_name(ADW_STATUS_PAGE(empty),
-            linkgrabber ? "edit-find-symbolic" : "folder-download-symbolic");
-        adw_status_page_set_title(ADW_STATUS_PAGE(empty),
-            linkgrabber ? "Linkgrabber empty" : "No downloads");
-        adw_status_page_set_description(ADW_STATUS_PAGE(empty),
-            linkgrabber ? "Use + → “Review in linkgrabber” to stage links."
-                        : "Click + to add a URL or archive.org item.");
-        GtkWidget *r = gtk_list_box_row_new();
-        gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(r), FALSE);
-        gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(r), empty);
-        gtk_list_box_append(list, r);
+    GPtrArray *sigs = g_ptr_array_new_full(v->len, g_free);
+    for (guint i = 0; i < v->len; i++) {
+        RowDesc *r = &g_array_index(v, RowDesc, i);
+        GtkWidget *w;
+        switch (r->kind) {
+        case RD_SITE: w = make_site_header(a, r->host, r->count, linkgrabber); break;
+        case RD_PKG:  w = make_pkg_header(a, r->p, linkgrabber, r->indent); break;
+        case RD_ROW:  w = make_row(r->d, linkgrabber, r->indent); break;
+        default:      w = make_empty_row(linkgrabber); break;
+        }
+        g_object_set_data_full(G_OBJECT(w), "dlm-key", g_strdup(r->key), g_free);
+        gtk_list_box_append(list, w);
+        g_ptr_array_add(sigs, g_strdup(r->sig));
     }
+    g_object_set_data_full(G_OBJECT(list), "dlm-sigs", sigs,
+                           (GDestroyNotify)g_ptr_array_unref);
+
+    /* put focus back on the same control of the same row (or its neighbour) */
+    if (fidx >= 0) {
+        GtkWidget *target = NULL;
+        if (fkey)
+            for (GtkWidget *w = gtk_widget_get_first_child(GTK_WIDGET(list)); w;
+                 w = gtk_widget_get_next_sibling(w))
+                if (!g_strcmp0(g_object_get_data(G_OBJECT(w), "dlm-key"), fkey)) {
+                    target = w;
+                    break;
+                }
+        if (!target && v->len > 0) {
+            int idx = MIN(fidx, (int)v->len - 1);
+            GtkListBoxRow *r = gtk_list_box_get_row_at_index(list, idx);
+            target = r ? GTK_WIDGET(r) : NULL;
+        }
+        if (target) {
+            GtkWidget *c = fctl ? find_ctl(target, fctl) : NULL;
+            if (!c || !gtk_widget_grab_focus(c)) gtk_widget_grab_focus(target);
+        }
+    }
+    g_free(fkey);
+    g_array_unref(v);
 }
 
 static void rebuild_list(App *a)
 {
+    if (!a->win) return;                      /* window already destroyed */
     /* Don't rebuild rows while a menu is open — it would dismiss the popover.
      * The status bar below still updates; the rows refresh once it closes. */
     if (a->open_menus > 0) {
@@ -1147,6 +1806,9 @@ static void rebuild_list(App *a)
         render_into(a, a->dlist, "download", current_filter(a));
         render_into(a, a->glist, "linkgrabber", NULL);
     }
+
+    /* while disconnected keep the "Not connected" status, not stale numbers */
+    if (a->stale) return;
 
     double total_speed = 0;
     int dl = 0, lg = 0;
@@ -1253,13 +1915,35 @@ static void apply_downloads(App *a, json_t *arr)
     }
 }
 
+/* Daemon gone: say so plainly and grey out the (now stale) lists. */
+static void mark_disconnected(App *a)
+{
+    a->stale = 1;
+    /* the first payload after reconnecting must render even if identical */
+    g_free(a->last_event);
+    a->last_event = NULL;
+    if (!a->win) return;
+    gtk_label_set_text(a->status, "Not connected to the daemon \xE2\x80\x94 reconnecting\xE2\x80\xA6");
+    gtk_widget_set_sensitive(GTK_WIDGET(a->dlist), FALSE);
+    gtk_widget_set_sensitive(GTK_WIDGET(a->glist), FALSE);
+}
+
+static void mark_connected(App *a)
+{
+    if (!a->stale) return;
+    a->stale = 0;
+    if (!a->win) return;
+    gtk_widget_set_sensitive(GTK_WIDGET(a->dlist), TRUE);
+    gtk_widget_set_sensitive(GTK_WIDGET(a->glist), TRUE);
+}
+
 static void handle_line(App *a, const char *line)
 {
+    mark_connected(a);
     /* The daemon re-sends the full state every 0.5s even when nothing changed
      * (e.g. while reviewing the linkgrabber with nothing downloading). Skip
-     * identical payloads so the list isn't torn down and rebuilt under the
-     * user — a constant rebuild destroys row/menu widgets mid-click and makes
-     * the ⋮ menus impossible to open. */
+     * identical payloads so the list isn't refreshed under the user for
+     * nothing. */
     if (a->last_event && strcmp(a->last_event, line) == 0) return;
     g_free(a->last_event);
     a->last_event = g_strdup(line);
@@ -1288,82 +1972,121 @@ static gboolean on_socket_readable(GIOChannel *src, GIOCondition cond, gpointer 
 {
     (void)src;
     App *a = user;
-    if (cond & (G_IO_HUP | G_IO_ERR)) goto closed;
-
+    /* On HUP/ERR the peer may still have sent data we haven't read (e.g. a last
+     * snapshot before exiting): drain and process it first, then close. */
+    int hup = (cond & (G_IO_HUP | G_IO_ERR)) != 0;
+    int closed = 0;
     char buf[8192];
-    long got = dlm_sock_read((dlm_sock_t)a->sub_fd, buf, sizeof buf);
-    if (got <= 0) goto closed;
-    g_string_append_len(a->rx, buf, got);
+    for (;;) {
+        long got = dlm_sock_read((dlm_sock_t)a->sub_fd, buf, sizeof buf);
+        if (got < 0 && dlm_sock_was_intr()) continue;
+        if (got < 0 && dlm_sock_would_block()) break;   /* nothing (more) now */
+        if (got <= 0) { closed = 1; break; }            /* EOF / error */
+        g_string_append_len(a->rx, buf, got);
 
-    char *nl;
-    while ((nl = memchr(a->rx->str, '\n', a->rx->len))) {
-        *nl = '\0';
-        handle_line(a, a->rx->str);
-        size_t consumed = (size_t)(nl - a->rx->str) + 1;
-        g_string_erase(a->rx, 0, consumed);
+        char *nl;
+        while ((nl = memchr(a->rx->str, '\n', a->rx->len))) {
+            *nl = '\0';
+            handle_line(a, a->rx->str);
+            size_t consumed = (size_t)(nl - a->rx->str) + 1;
+            g_string_erase(a->rx, 0, consumed);
+        }
+        /* a line that never ends must not grow without bound: drop + reconnect */
+        if (a->rx->len > GUI_LINE_MAX) { closed = 1; break; }
+        if (!hup) break;                                /* one read per wakeup */
     }
-    return G_SOURCE_CONTINUE;
+    if (!closed && !hup) return G_SOURCE_CONTINUE;
 
-closed:
     a->sub_source = 0;
     if (a->sub_fd >= 0) { dlm_client_close(a->sub_fd); a->sub_fd = -1; }
+    g_string_truncate(a->rx, 0);
+    mark_disconnected(a);
     schedule_reconnect(a);
     return G_SOURCE_REMOVE;
 }
 
-static void connect_subscribe(App *a)
+/* Worker thread: connect (possibly auto-starting dlmd) and send "subscribe".
+ * Returns the fd, or -1. Touches nothing but its own fd. */
+static void sub_connect_worker(GTask *task, gpointer src, gpointer data, GCancellable *c)
 {
-    a->sub_fd = dlm_client_connect();
-    if (a->sub_fd < 0) { schedule_reconnect(a); return; }
-    const char *sub = "{\"cmd\":\"subscribe\"}\n";
-    size_t slen = strlen(sub), off = 0;
-    int werr = 0;
-    while (off < slen) { /* full-write: a short write must not desync the stream */
-        long w = dlm_sock_write((dlm_sock_t)a->sub_fd, sub + off, slen - off);
-        if (w < 0) {
-            if (dlm_sock_was_intr()) continue;
-            werr = 1;
-            break;
+    (void)src; (void)data; (void)c;
+    int fd = locked_connect();
+    if (fd >= 0) {
+        const char *sub = "{\"cmd\":\"subscribe\"}\n";
+        size_t slen = strlen(sub), off = 0;
+        while (off < slen) { /* full-write: a short write must not desync the stream */
+            long w = dlm_sock_write((dlm_sock_t)fd, sub + off, slen - off);
+            if (w < 0) {
+                if (dlm_sock_was_intr()) continue;
+                dlm_client_close(fd);
+                fd = -1;
+                break;
+            }
+            off += (size_t)w;
         }
-        off += (size_t)w;
     }
-    if (werr) {
-        dlm_client_close(a->sub_fd);
-        a->sub_fd = -1;
+    g_task_return_int(task, fd);
+}
+
+static void sub_connect_done(GObject *src, GAsyncResult *res, gpointer user)
+{
+    (void)src;
+    App *a = user;
+    a->connecting = 0;
+    int fd = (int)g_task_propagate_int(G_TASK(res), NULL);
+    if (!a->win) {                       /* window closed meanwhile */
+        if (fd >= 0) dlm_client_close(fd);
+        return;
+    }
+    if (fd < 0) {
+        mark_disconnected(a);
         schedule_reconnect(a);
         return;
     }
+    a->sub_fd = fd;
     g_string_truncate(a->rx, 0);
     a->sub_source = dlm_gui_add_socket_watch(a->sub_fd, G_IO_IN | G_IO_HUP | G_IO_ERR,
                                              on_socket_readable, a);
 }
 
+/* Start one background connect; never more than one at a time. */
+static void connect_subscribe(App *a)
+{
+    if (a->connecting || a->sub_fd >= 0 || !a->win) return;
+    a->connecting = 1;
+    GTask *t = g_task_new(NULL, NULL, sub_connect_done, a);
+    g_task_run_in_thread(t, sub_connect_worker);
+    g_object_unref(t);
+}
+
 static gboolean reconnect_cb(gpointer u)
 {
-    connect_subscribe((App *)u);
+    App *a = u;
+    a->reconnect_id = 0;
+    connect_subscribe(a);
     return G_SOURCE_REMOVE;
 }
 
+/* Retry in 2 s — unless a retry is already pending or a connect is running,
+ * so attempts can't stack up behind a slow daemon start. */
 static void schedule_reconnect(App *a)
 {
-    g_timeout_add_seconds(2, reconnect_cb, a);
+    if (a->reconnect_id || a->connecting || !a->win) return;
+    a->reconnect_id = g_timeout_add_seconds(2, reconnect_cb, a);
 }
 
 /* ---- add dialog ------------------------------------------------------- */
 
-/* Sanitize one path segment: neutralise filesystem-hostile characters
- * (/ \ : * ? " < > | and control chars). Caller g_free()s. */
+/* Sanitize one path segment via the shared libdlm policy (separators and
+ * Windows-hostile characters, no "."/"..", device names, length cap). Empty
+ * input stays "" as before (callers only pass non-empty segments). Caller
+ * g_free()s. */
 static char *sanitize_segment(const char *s)
 {
     if (!s || !*s) return g_strdup("");
-    char *out = g_strdup(s);
-    for (char *p = out; *p; p++) {
-        switch ((unsigned char)*p) {
-        case '/': case '\\': case ':': case '*': case '?':
-        case '"': case '<': case '>': case '|': *p = '_'; break;
-        default: if ((unsigned char)*p < 0x20) *p = '_';
-        }
-    }
+    char *safe = dlm_sanitize_component(s, 0);   /* malloc'd: free() */
+    char *out = g_strdup(safe ? safe : "download");
+    free(safe);
     return out;
 }
 
@@ -1405,18 +2128,30 @@ typedef struct {
     int ok;                  /* resolve succeeded with >0 tasks */
 } ResolveCtx;
 
-/* Enqueue each resolved task directly into the download list. */
+/* Toast once the background adds are done (job->user = "(source) to dest"). */
+static void stage_add_done(CmdJob *j)
+{
+    if (!g_app.win || !j->connected || j->mkdir_errno) return;
+    int added = j->nok;
+    char *msg = g_strdup_printf("Added %d %s %s", added,
+                                added == 1 ? "download" : "files", (char *)j->user);
+    toast(&g_app, msg);
+    g_free(msg);
+}
+
+/* Enqueue each resolved task directly into the download list. The folder is
+ * created and the adds are sent in order on the command worker thread (over
+ * one connection), not on the UI thread. */
 static void stage_add(ResolveCtx *rc)
 {
     const char *url = rc->url, *dir = rc->dir;
     dlm_extract_result res = rc->res;
     /* lay files out under <dir>/<host>/[<title>/] */
     char *dest = build_dest_dir(dir, url, res.title, res.count > 1);
-    g_mkdir_with_parents(dest, 0755);
-    int added = 0;
+    CmdJob *j = cmd_job_new();
+    j->mkdir = g_strdup(dest);
     for (int i = 0; i < res.count; i++) {
-        char path[4096];
-        snprintf(path, sizeof path, "%s/%s", dest, res.tasks[i].filename);
+        char *path = g_build_filename(dest, res.tasks[i].filename, NULL);
         json_t *r = json_object();
         json_object_set_new(r, "cmd", json_string("add"));
         json_object_set_new(r, "url", json_string(res.tasks[i].url));
@@ -1425,14 +2160,14 @@ static void stage_add(ResolveCtx *rc)
         if (rc->conns > 0) json_object_set_new(r, "connections", json_integer(rc->conns));
         char *s = json_dumps(r, JSON_COMPACT);
         json_decref(r);
-        send_cmd(s);
+        if (s) cmd_job_add(j, s);
         free(s);
-        added++;
+        g_free(path);
     }
-    char msg[4096];
-    snprintf(msg, sizeof msg, "Added %d %s (%s) to %s", added,
-             added == 1 ? "download" : "files", res.source, dest);
-    toast(&g_app, msg);
+    j->user = g_strdup_printf("(%s) to %s", res.source ? res.source : "", dest);
+    j->user_free = g_free;
+    j->done = stage_add_done;
+    cmd_submit(j);
     g_free(dest);
 }
 
@@ -1479,11 +2214,11 @@ static void stage_grab(ResolveCtx *rc)
     json_t *links = json_array();
     for (int i = 0; i < res.count; i++) {
         dlm_task *t = &res.tasks[i];
-        char path[4096];
-        snprintf(path, sizeof path, "%s/%s", dest, t->filename);
+        char *path = g_build_filename(dest, t->filename, NULL);
         json_t *l = json_object();
         json_object_set_new(l, "url", json_string(t->url));
         json_object_set_new(l, "out", json_string(path));
+        g_free(path);
         json_object_set_new(l, "name", json_string(t->filename));
         json_object_set_new(l, "size", json_integer(t->size));
         if (t->delegate) json_object_set_new(l, "delegate", json_true());
@@ -1495,12 +2230,11 @@ static void stage_grab(ResolveCtx *rc)
     json_object_set_new(r, "links", links);
     char *s = json_dumps(r, JSON_COMPACT);
     json_decref(r);
-    send_cmd(s);
-    free(s);
     char msg[128];
     snprintf(msg, sizeof msg, "Staged %d %s (%s) in the linkgrabber", res.count,
              res.count == 1 ? "link" : "links", res.source);
-    toast(&g_app, msg);
+    if (s) send_cmd_toast(s, msg);
+    free(s);
     g_free(dest);
 }
 
@@ -1510,7 +2244,7 @@ static void stage_grab(ResolveCtx *rc)
 static void update_activity(App *a)
 {
     if (!a->spinner || !a->banner) return;
-    if (a->resolving > 0) {
+    if (a->resolving > 0 || a->ia_busy) {
         gtk_spinner_start(GTK_SPINNER(a->spinner));
         gtk_widget_set_visible(a->spinner, TRUE);
         adw_banner_set_revealed(a->banner, TRUE);
@@ -1568,7 +2302,7 @@ static void start_resolve(const char *url, const char *dir, int grab, int conns)
     char banner[320];
     if (host[0]) snprintf(banner, sizeof banner, "Checking %s…", host);
     else snprintf(banner, sizeof banner, "Resolving…");
-    adw_banner_set_title(a->banner, banner);
+    if (a->banner) adw_banner_set_title(a->banner, banner);
     a->resolving++;
     update_activity(a);
 
@@ -1631,6 +2365,7 @@ static void on_add_clicked(GtkButton *b, gpointer user)
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     GtkWidget *url = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(url), "https://…");
+    set_a11y_label(url, "Download URL");
     gtk_widget_set_size_request(url, 380, -1);
     /* auto-paste: prefill from the clipboard if it holds a link */
     GdkClipboard *clip = gtk_widget_get_clipboard(GTK_WIDGET(a->win));
@@ -1638,6 +2373,7 @@ static void on_add_clicked(GtkButton *b, gpointer user)
                                   g_object_ref(GTK_EDITABLE(url)));
     GtkWidget *dir = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(dir), "Download folder");
+    set_a11y_label(dir, "Download folder");
     gtk_editable_set_text(GTK_EDITABLE(dir), a->download_dir);
     gtk_box_append(GTK_BOX(box), url);
     gtk_box_append(GTK_BOX(box), dir);
@@ -1652,6 +2388,7 @@ static void on_add_clicked(GtkButton *b, gpointer user)
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(conns), 0);
     gtk_widget_set_tooltip_text(conns, "Parallel segments per file (0 = engine default)");
     gtk_widget_set_valign(conns, GTK_ALIGN_CENTER);
+    set_labelled_by(conns, clabel);
     gtk_box_append(GTK_BOX(crow), clabel);
     gtk_box_append(GTK_BOX(crow), conns);
     gtk_box_append(GTK_BOX(box), crow);
@@ -1664,6 +2401,7 @@ static void on_add_clicked(GtkButton *b, gpointer user)
     gtk_label_set_xalign(GTK_LABEL(glabel), 0.0);
     GtkWidget *gsw = gtk_switch_new();
     gtk_widget_set_valign(gsw, GTK_ALIGN_CENTER);
+    set_labelled_by(gsw, glabel);
     gtk_box_append(GTK_BOX(grow), glabel);
     gtk_box_append(GTK_BOX(grow), gsw);
     gtk_box_append(GTK_BOX(box), grow);
@@ -1702,9 +2440,8 @@ static void on_pkg_edit_response(AdwAlertDialog *d, const char *response, gpoint
         if (fo && *fo) json_object_set_new(r, "folder", json_string(fo));
         char *s = json_dumps(r, JSON_COMPACT);
         json_decref(r);
-        send_cmd(s);
+        if (s) send_cmd_toast(s, "Package updated");
         free(s);
-        toast(&g_app, "Package updated");
     }
     g_free(e);
 }
@@ -1729,9 +2466,11 @@ static void on_pkg_edit_clicked(GtkButton *b, gpointer user)
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     GtkWidget *name = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(name), "Package name");
+    set_a11y_label(name, "Package name");
     gtk_editable_set_text(GTK_EDITABLE(name), cur_name);
     GtkWidget *folder = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(folder), "Download folder");
+    set_a11y_label(folder, "Download folder");
     gtk_editable_set_text(GTK_EDITABLE(folder), cur_folder);
     gtk_box_append(GTK_BOX(box), name);
     gtk_box_append(GTK_BOX(box), folder);
@@ -1756,6 +2495,61 @@ typedef struct {
     GtkEditable *access, *secret, *cookie, *email, *password;
 } IaEntries;
 
+/* archive.org password login, run in a worker thread (it does network round
+ * trips). The task owns copies of the credentials and never touches widgets,
+ * so the (already closed) dialog can't be used after free. */
+typedef struct { char *email, *password, *err; int rc; } IaLogin;
+
+static void ia_login_free(gpointer p)
+{
+    IaLogin *l = p;
+    g_free(l->email);
+    if (l->password) {                       /* don't leave it lying in the heap */
+        memset(l->password, 0, strlen(l->password));
+        g_free(l->password);
+    }
+    g_free(l->err);
+    g_free(l);
+}
+
+static void ia_login_worker(GTask *task, gpointer src, gpointer data, GCancellable *c)
+{
+    (void)src; (void)c;
+    IaLogin *l = data;
+    l->rc = dlm_ia_login_password(l->email, l->password, &l->err);
+    g_task_return_boolean(task, TRUE);
+}
+
+static void ia_login_done(GObject *src, GAsyncResult *res, gpointer user)
+{
+    (void)src; (void)user;
+    App *a = &g_app;
+    IaLogin *l = g_task_get_task_data(G_TASK(res));
+    a->ia_busy = 0;
+    update_activity(a);
+    if (a->ia_btn) gtk_widget_set_sensitive(a->ia_btn, TRUE);
+    if (l->rc == 0) toast(a, "archive.org: signed in");
+    else toast(a, l->err ? l->err : "login failed");
+}
+
+static void start_ia_login(App *a, const char *email, const char *password)
+{
+    if (a->ia_busy) return;
+    IaLogin *l = g_new0(IaLogin, 1);
+    l->email = g_strdup(email);
+    l->password = g_strdup(password);
+    a->ia_busy = 1;
+    /* the dialog closes on any response, so show progress in the window: the
+     * header spinner + banner, and the account button is disabled until done */
+    if (a->banner) adw_banner_set_title(a->banner, "Signing in to archive.org\xE2\x80\xA6");
+    update_activity(a);
+    if (a->ia_btn) gtk_widget_set_sensitive(a->ia_btn, FALSE);
+    GTask *t = g_task_new(NULL, NULL, ia_login_done, NULL);
+    g_task_set_task_data(t, l, ia_login_free);
+    g_task_run_in_thread(t, ia_login_worker);
+    g_object_unref(t);
+}
+
 static void on_ia_response(AdwAlertDialog *d, const char *response, gpointer user)
 {
     (void)d;
@@ -1770,10 +2564,7 @@ static void on_ia_response(AdwAlertDialog *d, const char *response, gpointer use
             dlm_ia_save_s3(ak, sk);
             toast(&g_app, "archive.org: signed in (S3 keys)");
         } else if (*em && *pw) {
-            char *err = NULL;
-            if (dlm_ia_login_password(em, pw, &err) == 0)
-                toast(&g_app, "archive.org: signed in");
-            else { toast(&g_app, err ? err : "login failed"); g_free(err); }
+            start_ia_login(&g_app, em, pw);
         } else if (*ck) {
             dlm_ia_save_cookie(ck);
             toast(&g_app, "archive.org: signed in (cookie)");
@@ -1795,6 +2586,8 @@ static GtkWidget *labeled(GtkWidget *box, const char *label)
     gtk_widget_add_css_class(l, "caption");
     gtk_box_append(GTK_BOX(box), l);
     GtkWidget *e = gtk_entry_new();
+    gtk_label_set_mnemonic_widget(GTK_LABEL(l), e);
+    set_labelled_by(e, l);
     gtk_box_append(GTK_BOX(box), e);
     return e;
 }
@@ -1915,19 +2708,28 @@ static void on_settings_response(AdwAlertDialog *d, const char *response, gpoint
         json_t *r = json_object();
         json_object_set_new(r, "cmd", json_string("set"));
         if (jt && *jt) json_object_set_new(r, "max_active", json_integer(atoi(jt)));
-        /* empty / "off" / "0" clears the cap */
-        int64_t bps = (lt && *lt && g_strcmp0(lt, "off")) ? dlm_parse_rate(lt) : 0;
-        json_object_set_new(r, "max_speed", json_integer(bps));
+        /* empty / "0" / "off" / "none" / "unlimited" clears the cap; any
+         * other text must parse as a rate, otherwise keep the current limit
+         * and say so instead of silently clearing it */
+        int clear = !lt || !*lt || !strcmp(lt, "0") || !g_ascii_strcasecmp(lt, "off") ||
+                    !g_ascii_strcasecmp(lt, "none") || !g_ascii_strcasecmp(lt, "unlimited");
+        int64_t bps = clear ? 0 : dlm_parse_rate(lt);
+        int bad_rate = !clear && bps <= 0;
+        if (!bad_rate)
+            json_object_set_new(r, "max_speed", json_integer(bps));
         json_object_set_new(r, "auto_tools",
             json_boolean(gtk_switch_get_active(GTK_SWITCH(e->auto_tools))));
         char *s = json_dumps(r, JSON_COMPACT);
         json_decref(r);
-        send_cmd(s);
-        free(s);
-        char msg[64], rb[32];
+        char msg[160], rb[32];
         dlm_format_rate(bps, rb, sizeof rb);
-        snprintf(msg, sizeof msg, "Speed limit: %s", rb);
-        toast(&g_app, msg);
+        if (bad_rate)
+            snprintf(msg, sizeof msg, "Speed limit not changed: \xE2\x80\x9C%.40s\xE2\x80\x9D is not a rate "
+                     "(e.g. 500k, 2M)", lt);
+        else
+            snprintf(msg, sizeof msg, "Speed limit: %s", rb);
+        if (s) send_cmd_toast(s, msg);
+        free(s);
     }
     g_free(e);
 }
@@ -1940,23 +2742,19 @@ static void on_tools_update_clicked(GtkButton *b, gpointer user)
     toast(&g_app, "Checking yt-dlp for updates\xE2\x80\xA6");
 }
 
-/* Query the daemon's current settings, including auto-tools state and the
- * installed yt-dlp version (ytver may be set to "" if unknown). */
-static void query_settings(int *max_active, gint64 *max_speed, int *auto_tools,
-                           char *ytver, size_t verlen)
+/* Parse the daemon's current settings from a "list" reply (NULL when the
+ * daemon couldn't be reached), including auto-tools state and the installed
+ * yt-dlp version (ytver may be set to "" if unknown). */
+static void parse_settings(const char *resp, int *max_active, gint64 *max_speed,
+                           int *auto_tools, char *ytver, size_t verlen)
 {
     *max_active = 0;
     *max_speed = 0;
     *auto_tools = 1;
     if (ytver && verlen) ytver[0] = '\0';
-    int fd = dlm_client_connect();
-    if (fd < 0) return;
-    char *resp = dlm_client_rpc(fd, "{\"cmd\":\"list\"}");
-    dlm_client_close(fd);
     if (!resp) return;
     json_error_t e;
     json_t *root = json_loads(resp, 0, &e);
-    free(resp);
     if (!root) return;
     *max_active = (int)json_integer_value(json_object_get(root, "max_active"));
     *max_speed = json_integer_value(json_object_get(root, "max_speed"));
@@ -1987,22 +2785,27 @@ static void on_about_clicked(GtkButton *b, gpointer user)
     adw_dialog_present(ADW_DIALOG(about), GTK_WIDGET(a->win));
 }
 
-static void on_settings_clicked(GtkButton *b, gpointer user)
+/* Settings query answered (on the main thread): build + show the dialog. */
+static void settings_query_done(CmdJob *j)
 {
-    (void)b;
-    App *a = user;
+    App *a = &g_app;
+    a->settings_pending = 0;
+    if (!a->win) return;
     AdwDialog *d = adw_alert_dialog_new("Settings", NULL);
 
     int cur_jobs = 0, cur_auto = 1;
     gint64 cur_speed = 0;
     char ytver[64] = "";
-    query_settings(&cur_jobs, &cur_speed, &cur_auto, ytver, sizeof ytver);
+    parse_settings(j->resps->len ? g_ptr_array_index(j->resps, 0) : NULL,
+                   &cur_jobs, &cur_speed, &cur_auto, ytver, sizeof ytver);
 
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     GtkWidget *jobs = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(jobs), "Max concurrent downloads (e.g. 3)");
+    set_a11y_label(jobs, "Max concurrent downloads");
     GtkWidget *limit = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(limit), "Speed limit (e.g. 2M, 500k, off)");
+    set_a11y_label(limit, "Speed limit");
     /* prefill with the daemon's current settings */
     if (cur_jobs > 0) {
         char jb[16];
@@ -2026,6 +2829,7 @@ static void on_settings_clicked(GtkButton *b, gpointer user)
     GtkWidget *autosw = gtk_switch_new();
     gtk_switch_set_active(GTK_SWITCH(autosw), cur_auto);
     gtk_widget_set_valign(autosw, GTK_ALIGN_CENTER);
+    set_labelled_by(autosw, tlabel);
     gtk_box_append(GTK_BOX(trow), tlabel);
     gtk_box_append(GTK_BOX(trow), autosw);
     gtk_box_append(GTK_BOX(box), trow);
@@ -2057,19 +2861,32 @@ static void on_settings_clicked(GtkButton *b, gpointer user)
     adw_dialog_present(d, GTK_WIDGET(a->win));
 }
 
+/* Fetch the current settings in the background, then show the dialog. */
+static void on_settings_clicked(GtkButton *b, gpointer user)
+{
+    (void)b;
+    App *a = user;
+    if (a->settings_pending) return;
+    a->settings_pending = 1;
+    CmdJob *j = cmd_job_new();
+    cmd_job_add(j, "{\"cmd\":\"list\"}");
+    j->quiet = 1;                  /* unreachable => dialog with defaults, as before */
+    j->done = settings_query_done;
+    cmd_submit(j);
+}
+
 /* ---- global queue controls ------------------------------------------- */
 
 static void on_global_start(GtkButton *b, gpointer u)
 {
     (void)b; (void)u;
-    send_cmd("{\"cmd\":\"set\",\"autostart\":true}");
-    toast(&g_app, "Downloads running");
+    send_cmd_toast("{\"cmd\":\"set\",\"autostart\":true}", "Downloads running");
 }
 static void on_global_stop(GtkButton *b, gpointer u)
 {
     (void)b; (void)u;
-    send_cmd("{\"cmd\":\"set\",\"autostart\":false}");
-    toast(&g_app, "Stopping after current downloads");
+    send_cmd_toast("{\"cmd\":\"set\",\"autostart\":false}",
+                   "Stopping after current downloads");
 }
 static void on_clear_finished(GtkButton *b, gpointer u)
 {
@@ -2079,8 +2896,8 @@ static void on_clear_finished(GtkButton *b, gpointer u)
 static void on_confirm_all(GtkButton *b, gpointer u)
 {
     (void)b; (void)u;
-    send_cmd("{\"cmd\":\"confirm\",\"start\":true}");
-    toast(&g_app, "Linkgrabber confirmed into the queue");
+    send_cmd_toast("{\"cmd\":\"confirm\",\"start\":true}",
+                   "Linkgrabber confirmed into the queue");
 }
 
 /* ---- clipboard monitor (JDownloader-style auto-paste) ---------------- */
@@ -2091,8 +2908,10 @@ static void on_monitor_clip_ready(GObject *src, GAsyncResult *res, gpointer user
     App *a = user;
     char *text = gdk_clipboard_read_text_finish(GDK_CLIPBOARD(src), res, NULL);
     char *link = detect_url(text);
-    /* skip non-links and the same URL fired twice (some apps re-set on focus) */
-    if (link && g_strcmp0(link, a->clip_last) != 0) {
+    /* skip non-links and the same URL fired twice (some apps re-set on focus),
+     * and a link the focus-grab toast is currently offering */
+    if (link && g_strcmp0(link, a->clip_last) != 0 &&
+        g_strcmp0(link, a->clip_offered) != 0) {
         g_free(a->clip_last);
         a->clip_last = g_strdup(link);
         start_resolve(link, a->download_dir, 1, 0);
@@ -2127,30 +2946,59 @@ static void on_clip_toggle(GtkToggleButton *btn, gpointer user)
 
 /* ---- focus grab: offer to fetch a link copied while we were away ------ */
 
+/* The user acted on (or dismissed) the offer: only now is the link "seen", so
+ * it isn't offered again. */
+static void offer_settle(App *a, const char *link)
+{
+    if (!link) return;
+    g_free(a->clip_last);
+    a->clip_last = g_strdup(link);
+    if (!g_strcmp0(a->clip_offered, link)) {
+        g_free(a->clip_offered);
+        a->clip_offered = NULL;
+    }
+}
+
 /* The toast's "Grab" button: stage the offered link into the linkgrabber. */
 static void on_offer_grab(AdwToast *t, gpointer user)
 {
     App *a = user;
     const char *link = g_object_get_data(G_OBJECT(t), "dlm-link");
+    offer_settle(a, link);
     if (link) start_resolve(link, a->download_dir, 1, 0);
 }
 
+static void on_offer_dismissed(AdwToast *t, gpointer user)
+{
+    App *a = user;
+    offer_settle(a, g_object_get_data(G_OBJECT(t), "dlm-link"));
+    if (a->offer_toast == t) a->offer_toast = NULL;
+}
+
 /* Clipboard read finished after the window regained focus: if it holds a link
- * we haven't surfaced yet, show a dismissable toast offering to grab it. */
+ * we haven't surfaced yet, show a toast offering to grab it. The toast stays
+ * until the user grabs or dismisses it (no timeout to race a screen reader or
+ * a slow reader). */
 static void on_focus_clip_ready(GObject *src, GAsyncResult *res, gpointer user)
 {
     App *a = user;
     char *text = gdk_clipboard_read_text_finish(GDK_CLIPBOARD(src), res, NULL);
     char *link = detect_url(text);
-    if (link && g_strcmp0(link, a->clip_last) != 0) {
-        /* share clip_last with the auto-paste monitor: a link it already grabbed
-         * won't be offered again, and an offered link won't be re-offered. */
-        g_free(a->clip_last);
-        a->clip_last = g_strdup(link);
+    /* share clip_last with the auto-paste monitor: a link it already grabbed
+     * won't be offered again, and a settled offer won't be re-offered. */
+    if (link && a->toast && g_strcmp0(link, a->clip_last) != 0 &&
+        g_strcmp0(link, a->clip_offered) != 0) {
+        /* a newer link replaces an older, still-open offer */
+        if (a->offer_toast) adw_toast_dismiss(a->offer_toast);
+        g_free(a->clip_offered);
+        a->clip_offered = g_strdup(link);
         AdwToast *t = adw_toast_new("Link copied — grab it?");
         adw_toast_set_button_label(t, "Grab");
+        adw_toast_set_timeout(t, 0);
         g_object_set_data_full(G_OBJECT(t), "dlm-link", g_strdup(link), g_free);
         g_signal_connect(t, "button-clicked", G_CALLBACK(on_offer_grab), a);
+        g_signal_connect(t, "dismissed", G_CALLBACK(on_offer_dismissed), a);
+        a->offer_toast = t;
         adw_toast_overlay_add_toast(a->toast, t);
     }
     g_free(link);
@@ -2163,12 +3011,39 @@ static void on_win_active(GObject *obj, GParamSpec *ps, gpointer user)
 {
     (void)ps;
     App *a = user;
-    if (!gtk_window_is_active(GTK_WINDOW(obj))) return;
+    if (!a->win || !gtk_window_is_active(GTK_WINDOW(obj))) return;
     GdkClipboard *clip = gtk_widget_get_clipboard(GTK_WIDGET(a->win));
     gdk_clipboard_read_text_async(clip, NULL, on_focus_clip_ready, a);
 }
 
 /* ---- activate / main -------------------------------------------------- */
+
+/* The window is going away: stop the stream + timers and forget every widget
+ * pointer, so late async completions (commands, resolves, logins) see
+ * g_app.win == NULL and only clean up. */
+static void on_win_destroy(GtkWidget *w, gpointer user)
+{
+    (void)w;
+    App *a = user;
+    if (a->sub_source) { g_source_remove(a->sub_source); a->sub_source = 0; }
+    if (a->sub_fd >= 0) { dlm_client_close(a->sub_fd); a->sub_fd = -1; }
+    if (a->reconnect_id) { g_source_remove(a->reconnect_id); a->reconnect_id = 0; }
+    if (a->clip && a->clip_handler) {
+        g_signal_handler_disconnect(a->clip, a->clip_handler);
+        a->clip_handler = 0;
+    }
+    a->clip = NULL;
+    a->offer_toast = NULL;
+    a->win = NULL;
+    a->toast = NULL;
+    a->dlist = a->glist = NULL;
+    a->stack = NULL;
+    a->status = NULL;
+    a->filter = NULL;
+    a->spinner = NULL;
+    a->banner = NULL;
+    a->ia_btn = NULL;
+}
 
 /* A boxed list box inside a scroller (one per view). */
 static GtkWidget *make_scrolled_list(GtkListBox **out)
@@ -2207,6 +3082,7 @@ static void on_activate(GtkApplication *app, gpointer user)
 
     GtkWidget *add = gtk_button_new_from_icon_name("list-add-symbolic");
     gtk_widget_set_tooltip_text(add, "Add download (or stage in linkgrabber)");
+    set_a11y_label(add, "Add download (or stage in linkgrabber)");
     gtk_widget_add_css_class(add, "suggested-action");
     g_signal_connect(add, "clicked", G_CALLBACK(on_add_clicked), a);
     adw_header_bar_pack_start(ADW_HEADER_BAR(header), add);
@@ -2214,10 +3090,12 @@ static void on_activate(GtkApplication *app, gpointer user)
     /* Start / Stop the queue (global autostart) + clear finished */
     GtkWidget *start = gtk_button_new_from_icon_name("media-playback-start-symbolic");
     gtk_widget_set_tooltip_text(start, "Start downloads");
+    set_a11y_label(start, "Start downloads");
     g_signal_connect(start, "clicked", G_CALLBACK(on_global_start), a);
     adw_header_bar_pack_start(ADW_HEADER_BAR(header), start);
     GtkWidget *stop = gtk_button_new_from_icon_name("media-playback-stop-symbolic");
     gtk_widget_set_tooltip_text(stop, "Stop after current downloads");
+    set_a11y_label(stop, "Stop after current downloads");
     g_signal_connect(stop, "clicked", G_CALLBACK(on_global_stop), a);
     adw_header_bar_pack_start(ADW_HEADER_BAR(header), stop);
 
@@ -2238,16 +3116,20 @@ static void on_activate(GtkApplication *app, gpointer user)
     const char *const filters[] = {"All", "Active", "Queued", "Done", NULL};
     GtkWidget *filter = gtk_drop_down_new_from_strings(filters);
     a->filter = GTK_DROP_DOWN(filter);
+    gtk_widget_set_tooltip_text(filter, "Show downloads by state");
+    set_a11y_label(filter, "Filter downloads by state");
     g_signal_connect(filter, "notify::selected", G_CALLBACK(on_filter_changed), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), filter);
 
     GtkWidget *clear = gtk_button_new_from_icon_name("edit-clear-all-symbolic");
     gtk_widget_set_tooltip_text(clear, "Clear finished downloads");
+    set_a11y_label(clear, "Clear finished downloads");
     g_signal_connect(clear, "clicked", G_CALLBACK(on_clear_finished), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), clear);
 
     GtkWidget *confirm = gtk_button_new_from_icon_name("object-select-symbolic");
     gtk_widget_set_tooltip_text(confirm, "Confirm all linkgrabber links into the queue");
+    set_a11y_label(confirm, "Confirm all linkgrabber links into the queue");
     g_signal_connect(confirm, "clicked", G_CALLBACK(on_confirm_all), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), confirm);
 
@@ -2256,21 +3138,26 @@ static void on_activate(GtkApplication *app, gpointer user)
     gtk_button_set_icon_name(GTK_BUTTON(clipmon), "edit-paste-symbolic");
     gtk_widget_set_tooltip_text(clipmon,
         "Auto-paste: watch the clipboard and stage copied links in the linkgrabber");
+    set_a11y_label(clipmon, "Auto-paste copied links");
     g_signal_connect(clipmon, "toggled", G_CALLBACK(on_clip_toggle), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), clipmon);
 
     GtkWidget *ia = gtk_button_new_from_icon_name("avatar-default-symbolic");
     gtk_widget_set_tooltip_text(ia, "archive.org account");
+    set_a11y_label(ia, "archive.org account");
+    a->ia_btn = ia;
     g_signal_connect(ia, "clicked", G_CALLBACK(on_ia_clicked), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), ia);
 
     GtkWidget *settings = gtk_button_new_from_icon_name("emblem-system-symbolic");
     gtk_widget_set_tooltip_text(settings, "Settings (concurrency, speed limit)");
+    set_a11y_label(settings, "Settings (concurrency, speed limit)");
     g_signal_connect(settings, "clicked", G_CALLBACK(on_settings_clicked), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), settings);
 
     GtkWidget *about = gtk_button_new_from_icon_name("help-about-symbolic");
     gtk_widget_set_tooltip_text(about, "About dlm (version)");
+    set_a11y_label(about, "About dlm (version)");
     g_signal_connect(about, "clicked", G_CALLBACK(on_about_clicked), a);
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), about);
 
@@ -2324,6 +3211,7 @@ static void on_activate(GtkApplication *app, gpointer user)
 
     /* offer to grab a link from the clipboard whenever we regain focus */
     g_signal_connect(win, "notify::is-active", G_CALLBACK(on_win_active), a);
+    g_signal_connect(win, "destroy", G_CALLBACK(on_win_destroy), a);
 
     gtk_window_present(a->win);
     connect_subscribe(a);
@@ -2367,6 +3255,7 @@ int main(int argc, char **argv)
     g_object_unref(g_app.app);
     g_string_free(g_app.rx, TRUE);
     g_free(g_app.clip_last);
+    g_free(g_app.clip_offered);
     g_free(g_app.last_event);
     g_free(g_app.download_dir);
     for (int i = 0; i < g_app.ncsites; i++) g_free(g_app.csites[i]);

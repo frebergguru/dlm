@@ -24,18 +24,18 @@
 
 /* ---- helpers ---------------------------------------------------------- */
 
-static char *sanitize_filename(const char *s)
+/* yt-dlp's "ext" is remote-influenced and appended to the file name verbatim,
+ * so accept only a short plain alphanumeric extension; anything else -> "bin". */
+static const char *safe_ext(const char *ext)
 {
-    if (!s || !*s) return dlm_xstrdup("download");
-    char *out = dlm_xstrdup(s);
-    for (char *p = out; *p; p++)
-        if (*p == '/' || *p == '\\' || *p == ':' || (unsigned char)*p < 0x20)
-            *p = '_';
-    /* A leading '.' (dotfile, or "."/"..") or '-' (option-looking) is risky once
-     * this becomes a basename; neutralise it. Separators are already gone, so
-     * the result can't traverse out of the target directory. */
-    if (out[0] == '.' || out[0] == '-') out[0] = '_';
-    return out;
+    if (!ext || !*ext) return "bin";
+    size_t n = 0;
+    for (const char *c = ext; *c; c++, n++) {
+        unsigned char u = (unsigned char)*c;
+        int ok = (u >= '0' && u <= '9') || (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z');
+        if (!ok || n >= 10) return "bin";
+    }
+    return ext;
 }
 
 /* Convert a yt-dlp http_headers object {"K":"V",...} to a "K: V" array. */
@@ -93,10 +93,11 @@ static int task_from_info(json_t *info, const char *input_url, dlm_task *t)
                    strcmp(ext, "unknown_video") == 0;
 
     /* filename: <title>.<ext> */
-    char *base = sanitize_filename(title ? title : "download");
-    size_t fnlen = strlen(base) + (ext ? strlen(ext) : 3) + 2;
+    char *base = dlm_sanitize_component(title && *title ? title : "download", 0);
+    const char *sext = safe_ext(ext);
+    size_t fnlen = strlen(base) + strlen(sext) + 2;
     t->filename = dlm_xmalloc(fnlen);
-    snprintf(t->filename, fnlen, "%s.%s", base, ext ? ext : "bin");
+    snprintf(t->filename, fnlen, "%s.%s", base, sext);
     free(base);
 
     int fragmented = is_fragmented_proto(proto) ||

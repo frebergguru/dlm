@@ -35,7 +35,7 @@
 #  include <unistd.h>
 #endif
 
-#define DLM_UA "dlm/0.1 (+segmented-downloader)"
+#define DLM_UA DLM_USER_AGENT
 #define DLM_DEFAULT_CONNS 4
 #define DLM_DEFAULT_MIN_SPLIT (1 << 20) /* 1 MiB */
 #define DLM_DEFAULT_RETRIES 5
@@ -55,6 +55,8 @@ typedef struct {
     long retries;
     long status;     /* HTTP status of the current attempt */
     int checked;     /* validated status-vs-range on this attempt */
+    int64_t cr_start;/* first byte of the 206 Content-Range, -1 if none seen */
+    int bad_range;   /* 206 started at the wrong offset on this attempt */
     int complete;
     int failed;      /* exhausted retries */
     CURL *easy;
@@ -106,6 +108,16 @@ static size_t probe_header_cb(char *buf, size_t size, size_t nmemb, void *userp)
     probe_headers_t *ph = userp;
     size_t len = size * nmemb;
 
+    /* A new status line starts a new response (each redirect hop has its own
+     * headers). Forget what the previous hop said, so a 30x's Content-Length
+     * or Accept-Ranges can't stick when the final response omits them. */
+    if (len >= 5 && strncmp(buf, "HTTP/", 5) == 0) {
+        ph->accept_ranges_bytes = 0;
+        ph->content_length = -1;
+        ph->content_range_total = -1;
+        return len;
+    }
+
     /* case-insensitive prefix match helper */
     if (len >= 14 && strncasecmp(buf, "accept-ranges:", 14) == 0) {
         if (len < 256) {
@@ -135,6 +147,22 @@ static size_t probe_abort_cb(char *p, size_t s, size_t n, void *u)
     return 0;
 }
 
+/* libcurl calls this at least about once a second even when no data flows
+ * (connecting, stalled server), so a pause/remove/shutdown is noticed promptly
+ * instead of waiting for the 120 s low-speed timeout. Non-zero aborts. */
+static int cancel_xferinfo_cb(void *userp, curl_off_t dltotal, curl_off_t dlnow,
+                              curl_off_t ultotal, curl_off_t ulnow)
+{
+    (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    dlm_download_t *dl = userp;
+    return (dl->cancel && *dl->cancel) ? 1 : 0;
+}
+
+static int is_cancelled(const dlm_download_t *dl)
+{
+    return dl->cancel && *dl->cancel;
+}
+
 static void apply_common_opts(CURL *c, dlm_download_t *dl)
 {
     curl_easy_setopt(c, CURLOPT_URL, dl->url);
@@ -155,6 +183,11 @@ static void apply_common_opts(CURL *c, dlm_download_t *dl)
         curl_easy_setopt(c, CURLOPT_HTTPHEADER, dl->header_list);
     if (dl->cookie)
         dlm_curl_set_scoped_cookie(c, dl->url, dl->cookie);
+    if (dl->cancel) {
+        curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, cancel_xferinfo_cb);
+        curl_easy_setopt(c, CURLOPT_XFERINFODATA, dl);
+        curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+    }
 }
 
 /* Probe size + range support. Sets dl->total and dl->resumable. */
@@ -172,6 +205,8 @@ static dlm_result probe(dlm_download_t *dl)
     CURLcode rc = curl_easy_perform(c);
     long code = 0;
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+
+    if (is_cancelled(dl)) { curl_easy_cleanup(c); return DLM_ERR_CANCELLED; }
 
     int need_get_probe = 0;
     if (rc != CURLE_OK || code >= 400 || ph.content_length < 0)
@@ -192,6 +227,7 @@ static dlm_result probe(dlm_download_t *dl)
         code = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         curl_easy_cleanup(c);
+        if (is_cancelled(dl)) return DLM_ERR_CANCELLED;
         /* probe_abort_cb stops the body, which surfaces as CURLE_WRITE_ERROR;
          * the headers we needed already arrived, so treat that as success. */
         if (rc == CURLE_WRITE_ERROR) rc = CURLE_OK;
@@ -236,6 +272,20 @@ static size_t seg_header_cb(char *buf, size_t size, size_t nmemb, void *userp)
         const char *sp = memchr(buf, ' ', len);
         s->status = sp ? atol(sp + 1) : 0;
         s->checked = 0; /* re-validate on next body write (handles redirects) */
+        s->cr_start = -1;
+    } else if (len >= 14 && strncasecmp(buf, "content-range:", 14) == 0) {
+        /* "Content-Range: bytes 1000-1999/5000" -> remember 1000 */
+        char tmp[128];
+        size_t n = len - 14 < sizeof tmp - 1 ? len - 14 : sizeof tmp - 1;
+        memcpy(tmp, buf + 14, n);
+        tmp[n] = '\0';
+        const char *p = tmp;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncasecmp(p, "bytes", 5) == 0) {
+            p += 5;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p >= '0' && *p <= '9') s->cr_start = (int64_t)strtoll(p, NULL, 10);
+        }
     }
     return len;
 }
@@ -255,6 +305,17 @@ static size_t seg_write_cb(char *ptr, size_t size, size_t nmemb, void *userp)
             /* Server ignored our Range: writing at an offset would corrupt the
              * file. Abort and let the caller fall back to a single stream. */
             dl->range_ignored = 1;
+            return 0;
+        }
+        /* A 206 whose range starts somewhere other than where we asked would
+         * land bytes at the wrong offset. Abort this attempt (it is retried
+         * like any other failed attempt) instead of corrupting the file. */
+        if (s->status == 206 && s->cr_start >= 0 &&
+            s->cr_start != s->start + s->done) {
+            DLM_WARN("segment %d: server sent range from %lld, asked %lld",
+                     s->index, (long long)s->cr_start,
+                     (long long)(s->start + s->done));
+            s->bad_range = 1;
             return 0;
         }
     }
@@ -305,6 +366,8 @@ static CURL *seg_make_easy(dlm_segment_t *s)
     }
     s->status = 0;
     s->checked = 0;
+    s->cr_start = -1;
+    s->bad_range = 0;
     s->easy = c;
     return c;
 }
@@ -461,10 +524,13 @@ static dlm_result run_multi(dlm_download_t *dl)
     dlm_result result = DLM_OK;
 
     while (active > 0) {
+        if (is_cancelled(dl)) { result = DLM_ERR_CANCELLED; goto cleanup; }
         int running = 0;
         CURLMcode mc = curl_multi_perform(multi, &running);
         if (mc == CURLM_OK)
             curl_multi_poll(multi, NULL, 0, 200, NULL);
+        else
+            dlm_sleep_ms(50); /* don't spin if the multi handle errors */
 
         /* drain completed transfers */
         int msgs = 0;
@@ -773,4 +839,4 @@ void dlm_http_error_str(long code, char *buf, size_t n)
     else snprintf(buf, n, "HTTP %ld", code);
 }
 
-const char *dlm_version(void) { return "dlm 0.6.0"; }
+const char *dlm_version(void) { return "dlm " DLM_VERSION_STR; }

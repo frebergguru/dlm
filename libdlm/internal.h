@@ -36,6 +36,13 @@ void dlm_logf(dlm_log_level lvl, const char *fmt, ...)
 #define DLM_INFO(...) DLM_LOG(DLM_LOG_INFO, __VA_ARGS__)
 #define DLM_DEBUG(...) DLM_LOG(DLM_LOG_DEBUG, __VA_ARGS__)
 
+/* ---- version ---------------------------------------------------------- */
+/* Set by CMake from project(VERSION); the fallback only covers odd builds. */
+#ifndef DLM_VERSION_STR
+#  define DLM_VERSION_STR "0.6.0"
+#endif
+#define DLM_USER_AGENT "dlm/" DLM_VERSION_STR " (+segmented-downloader)"
+
 /* ---- small helpers ---------------------------------------------------- */
 
 /* strdup that aborts on OOM (callers treat memory as infallible). */

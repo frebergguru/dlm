@@ -14,7 +14,8 @@
 
 struct dlm_proc {
     HANDLE proc;
-    HANDLE rd; /* read end of the capture pipe, or NULL */
+    HANDLE rd;  /* read end of the capture pipe, or NULL */
+    HANDLE job; /* Job object holding the child and its descendants, or NULL */
 };
 
 /* Build a single command line from argv using the MS C runtime quoting rules so
@@ -54,36 +55,122 @@ static char *build_cmdline(const char *const argv[])
     return out;
 }
 
+/* Add h to the inherit list if it is a real, inheritable handle not already
+ * listed (PROC_THREAD_ATTRIBUTE_HANDLE_LIST rejects non-inheritable handles). */
+static void add_inherit(HANDLE *list, int *n, HANDLE h)
+{
+    if (!h || h == INVALID_HANDLE_VALUE) return;
+    DWORD fl = 0;
+    if (!GetHandleInformation(h, &fl) || !(fl & HANDLE_FLAG_INHERIT)) return;
+    for (int i = 0; i < *n; i++)
+        if (list[i] == h) return;
+    list[(*n)++] = h;
+}
+
+/* CreateProcessA that lets the child inherit ONLY the given handles (its std
+ * handles), not every inheritable handle in this process (sockets, other
+ * children's pipes, ...). Falls back to plain inheritance if the attribute
+ * list cannot be set up or the restricted create fails. */
+static BOOL create_process_restricted(char *cmd, DWORD flags, STARTUPINFOA *si,
+                                      HANDLE *handles, int nh, PROCESS_INFORMATION *pi)
+{
+    if (nh == 0) /* nothing to inherit at all */
+        return CreateProcessA(NULL, cmd, NULL, NULL, FALSE, flags, NULL, NULL, si, pi);
+
+    SIZE_T sz = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &sz);
+    LPPROC_THREAD_ATTRIBUTE_LIST al = sz ? (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(sz) : NULL;
+    if (al && InitializeProcThreadAttributeList(al, 1, 0, &sz)) {
+        BOOL ok = FALSE;
+        if (UpdateProcThreadAttribute(al, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles,
+                                      (SIZE_T)nh * sizeof(HANDLE), NULL, NULL)) {
+            STARTUPINFOEXA six;
+            memset(&six, 0, sizeof six);
+            six.StartupInfo = *si;
+            six.StartupInfo.cb = sizeof six;
+            six.lpAttributeList = al;
+            ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, flags | EXTENDED_STARTUPINFO_PRESENT,
+                                NULL, NULL, &six.StartupInfo, pi);
+        }
+        DeleteProcThreadAttributeList(al);
+        free(al);
+        if (ok) return TRUE;
+    } else {
+        free(al);
+    }
+    /* fallback: previous behaviour (inherit all inheritable handles) */
+    return CreateProcessA(NULL, cmd, NULL, NULL, TRUE, flags, NULL, NULL, si, pi);
+}
+
+/* A Job object that kills every process in it when terminated or when its last
+ * handle closes, so a launcher's real child (PyInstaller onefile yt-dlp.exe,
+ * yt-dlp's ffmpeg) dies with it. NULL if unavailable. */
+static HANDLE make_kill_job(void)
+{
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+    if (!job) return NULL;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
+    memset(&li, 0, sizeof li);
+    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li)) {
+        CloseHandle(job);
+        return NULL;
+    }
+    return job;
+}
+
 dlm_proc *dlm_proc_spawn(const char *const argv[], int capture)
 {
     HANDLE rd = NULL, wr = NULL;
     SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
     if (capture != DLM_SPAWN_INHERIT) {
         if (!CreatePipe(&rd, &wr, &sa, 0)) return NULL;
+        /* only the child's write end may be inherited, never our read end */
         SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
     }
     STARTUPINFOA si;
     memset(&si, 0, sizeof si);
     si.cb = sizeof si;
+    HANDLE inh[3];
+    int ninh = 0;
     if (capture != DLM_SPAWN_INHERIT) {
         si.dwFlags |= STARTF_USESTDHANDLES;
         si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
         si.hStdOutput = wr;
         si.hStdError = (capture == DLM_SPAWN_STDOUT_ERR) ? wr : GetStdHandle(STD_ERROR_HANDLE);
+        add_inherit(inh, &ninh, si.hStdInput);
+        add_inherit(inh, &ninh, si.hStdOutput);
+        add_inherit(inh, &ninh, si.hStdError);
+    } else {
+        add_inherit(inh, &ninh, GetStdHandle(STD_INPUT_HANDLE));
+        add_inherit(inh, &ninh, GetStdHandle(STD_OUTPUT_HANDLE));
+        add_inherit(inh, &ninh, GetStdHandle(STD_ERROR_HANDLE));
     }
     char *cmd = build_cmdline(argv);
     if (!cmd) { if (rd) CloseHandle(rd); if (wr) CloseHandle(wr); return NULL; }
+    HANDLE job = make_kill_job();
     PROCESS_INFORMATION pi;
     memset(&pi, 0, sizeof pi);
-    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    /* start suspended so it is inside the job before it can spawn anything */
+    BOOL ok = create_process_restricted(cmd, job ? CREATE_SUSPENDED : 0, &si, inh, ninh, &pi);
     free(cmd);
     if (wr) CloseHandle(wr);
-    if (!ok) { if (rd) CloseHandle(rd); return NULL; }
+    if (!ok) { if (rd) CloseHandle(rd); if (job) CloseHandle(job); return NULL; }
+    if (job) {
+        if (!AssignProcessToJobObject(job, pi.hProcess)) { CloseHandle(job); job = NULL; }
+        ResumeThread(pi.hThread);
+    }
     CloseHandle(pi.hThread);
     dlm_proc *p = calloc(1, sizeof *p);
-    if (!p) { CloseHandle(pi.hProcess); if (rd) CloseHandle(rd); return NULL; }
+    if (!p) {
+        if (job) CloseHandle(job); /* kills the child (KILL_ON_JOB_CLOSE) */
+        CloseHandle(pi.hProcess);
+        if (rd) CloseHandle(rd);
+        return NULL;
+    }
     p->proc = pi.hProcess;
     p->rd = rd;
+    p->job = job;
     return p;
 }
 
@@ -112,7 +199,15 @@ long dlm_proc_read(dlm_proc *p, void *buf, size_t n, int timeout_ms)
 
 void dlm_proc_terminate(dlm_proc *p)
 {
-    if (p && p->proc) TerminateProcess(p->proc, 1);
+    if (!p || !p->proc) return;
+    /* the whole job: the child and every descendant still in it */
+    if (p->job && TerminateJobObject(p->job, 1)) return;
+    TerminateProcess(p->proc, 1);
+}
+
+void dlm_proc_kill(dlm_proc *p)
+{
+    dlm_proc_terminate(p); /* already forceful on Windows */
 }
 
 int dlm_proc_wait(dlm_proc *p, int *exit_code)
@@ -130,6 +225,7 @@ void dlm_proc_free(dlm_proc *p)
     if (!p) return;
     if (p->rd) CloseHandle(p->rd);
     if (p->proc) CloseHandle(p->proc);
+    if (p->job) CloseHandle(p->job); /* KILL_ON_JOB_CLOSE reaps any leftovers */
     free(p);
 }
 
@@ -138,8 +234,10 @@ int dlm_proc_spawn_detached(const char *const argv[])
     STARTUPINFOA si;
     memset(&si, 0, sizeof si);
     si.cb = sizeof si;
+    /* inheritable so the child can actually receive it as its std handles */
+    SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
     HANDLE nul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
     si.dwFlags |= STARTF_USESTDHANDLES;
     si.hStdInput = nul;
     si.hStdOutput = nul;
@@ -148,8 +246,11 @@ int dlm_proc_spawn_detached(const char *const argv[])
     if (!cmd) { if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul); return -1; }
     PROCESS_INFORMATION pi;
     memset(&pi, 0, sizeof pi);
-    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE,
-                             DETACHED_PROCESS | CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    HANDLE inh[1];
+    int ninh = 0;
+    add_inherit(inh, &ninh, nul);
+    BOOL ok = create_process_restricted(cmd, DETACHED_PROCESS | CREATE_NO_WINDOW, &si,
+                                        inh, ninh, &pi);
     free(cmd);
     if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
     if (!ok) return -1;
@@ -165,12 +266,45 @@ int dlm_proc_spawn_detached(const char *const argv[])
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
+#include <time.h>
 #include <sys/wait.h>
+
+/* Grace period between SIGTERM and SIGKILL for a terminated child's group. */
+#define DLM_PROC_KILL_GRACE_MS 3000
 
 struct dlm_proc {
     pid_t pid;
-    int rfd; /* read end of capture pipe, or -1 */
+    pid_t pgid;      /* own process group (capture mode), or 0 */
+    int rfd;         /* read end of capture pipe, or -1 */
+    long long term_ms; /* monotonic ms when terminate was requested, or 0 */
+    int killed;      /* SIGKILL already sent */
 };
+
+static long long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Signal the child's whole process group if it has one, else just the child. */
+static void signal_proc(dlm_proc *p, int sig)
+{
+    if (p->pgid > 0 && kill(-p->pgid, sig) == 0) return;
+    kill(p->pid, sig);
+}
+
+/* If terminate was requested and the grace period ran out, SIGKILL the group.
+ * Returns the ms left in the grace period (0 once escalated / not pending). */
+static long long escalate_if_due(dlm_proc *p)
+{
+    if (!p->term_ms || p->killed) return 0;
+    long long left = p->term_ms + DLM_PROC_KILL_GRACE_MS - now_ms();
+    if (left > 0) return left;
+    signal_proc(p, SIGKILL);
+    p->killed = 1;
+    return 0;
+}
 
 dlm_proc *dlm_proc_spawn(const char *const argv[], int capture)
 {
@@ -183,6 +317,15 @@ dlm_proc *dlm_proc_spawn(const char *const argv[], int capture)
     }
     if (pid == 0) {
         if (capture != DLM_SPAWN_INHERIT) {
+            /* Own process group, so terminate reaches yt-dlp's ffmpeg children
+             * too. (INHERIT stays in our group: the CLI runs it on a terminal
+             * and Ctrl+C must reach it through the foreground group.) A
+             * background group must not touch the terminal, so stdin comes
+             * from /dev/null (otherwise a read/tcsetattr would stop it with
+             * SIGTTIN/SIGTTOU). */
+            setpgid(0, 0);
+            int nfd = open("/dev/null", O_RDONLY);
+            if (nfd >= 0) { dup2(nfd, STDIN_FILENO); if (nfd != STDIN_FILENO) close(nfd); }
             dup2(pfd[1], STDOUT_FILENO);
             if (capture == DLM_SPAWN_STDOUT_ERR) dup2(pfd[1], STDERR_FILENO);
             close(pfd[0]);
@@ -198,10 +341,18 @@ dlm_proc *dlm_proc_spawn(const char *const argv[], int capture)
         execvp(argv[0], (char *const *)argv);
         _exit(127);
     }
+    pid_t pgid = 0;
+    if (capture != DLM_SPAWN_INHERIT) {
+        /* also from the parent, so the group exists before we return no matter
+         * which side runs first (EACCES after exec is fine: child did it) */
+        setpgid(pid, pid);
+        pgid = pid;
+    }
     if (pfd[1] >= 0) close(pfd[1]);
     dlm_proc *p = calloc(1, sizeof *p);
     if (!p) { if (pfd[0] >= 0) close(pfd[0]); return NULL; }
     p->pid = pid;
+    p->pgid = pgid;
     p->rfd = pfd[0];
     return p;
 }
@@ -209,11 +360,20 @@ dlm_proc *dlm_proc_spawn(const char *const argv[], int capture)
 long dlm_proc_read(dlm_proc *p, void *buf, size_t n, int timeout_ms)
 {
     if (!p || p->rfd < 0) return -1;
-    if (timeout_ms >= 0) {
+    /* After terminate, never block past the grace period: a descendant that
+     * ignored SIGTERM would otherwise hold the pipe open forever. */
+    long long left = escalate_if_due(p);
+    if (timeout_ms >= 0 || left > 0) {
+        int wait_ms = timeout_ms;
+        if (left > 0 && (wait_ms < 0 || left < wait_ms)) wait_ms = (int)left;
         struct pollfd pf = { p->rfd, POLLIN, 0 };
-        int r = poll(&pf, 1, timeout_ms);
+        int r = poll(&pf, 1, wait_ms);
         if (r < 0) return (errno == EINTR) ? -1 : 0;
-        if (r == 0) return -1; /* timeout: caller re-checks cancel */
+        if (r == 0) {
+            escalate_if_due(p);
+            if (timeout_ms >= 0) return -1; /* timeout: caller re-checks cancel */
+            /* blocking caller: group is now SIGKILLed, so EOF is imminent */
+        }
     }
     ssize_t got = read(p->rfd, buf, n);
     if (got < 0) return (errno == EINTR) ? -1 : 0;
@@ -222,14 +382,51 @@ long dlm_proc_read(dlm_proc *p, void *buf, size_t n, int timeout_ms)
 
 void dlm_proc_terminate(dlm_proc *p)
 {
-    if (p) kill(p->pid, SIGTERM);
+    if (!p) return;
+    if (!p->term_ms) p->term_ms = now_ms();
+    if (!p->term_ms) p->term_ms = 1;
+    signal_proc(p, SIGTERM);
+}
+
+void dlm_proc_kill(dlm_proc *p)
+{
+    if (!p) return;
+    if (!p->term_ms) p->term_ms = 1;
+    signal_proc(p, SIGKILL);
+    p->killed = 1;
 }
 
 int dlm_proc_wait(dlm_proc *p, int *exit_code)
 {
     if (!p) return -1;
     int status = 0;
-    if (waitpid(p->pid, &status, 0) < 0) return -1;
+    pid_t r;
+    if (p->term_ms && !p->killed) {
+        /* terminated: give it the grace period, then SIGKILL the group */
+        for (;;) {
+            r = waitpid(p->pid, &status, WNOHANG);
+            if (r == p->pid) break;
+            if (r < 0 && errno != EINTR) return -1;
+            if (escalate_if_due(p) == 0) { r = 0; break; }
+            struct timespec ts = { 0, 50 * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+        if (r == 0) {
+            do r = waitpid(p->pid, &status, 0); while (r < 0 && errno == EINTR);
+            if (r < 0) return -1;
+        }
+    } else {
+        do r = waitpid(p->pid, &status, 0); while (r < 0 && errno == EINTR);
+        if (r < 0) return -1;
+    }
+    /* A terminated child is gone; make sure no member of its group outlives it
+     * (e.g. an ffmpeg that ignored SIGTERM). */
+    if (p->term_ms && p->pgid > 0 && !p->killed) {
+        while (kill(-p->pgid, 0) == 0 && escalate_if_due(p) > 0) {
+            struct timespec ts = { 0, 50 * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+    }
     if (exit_code) *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     return 0;
 }

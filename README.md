@@ -54,13 +54,25 @@ Dependencies: `libcurl`, `jansson`, `sqlite3`, `libpcre2-8`, `openssl`,
 
 ```sh
 ./build.sh                     # checks deps, builds, runs tests
-./install.sh                   # build + install system-wide (to /usr/local)
+./install.sh                   # install that build (to /usr/local); does not compile
 ```
 
-`install.sh` puts `dlm`, `dlmd` and `dlm-gui` on the PATH, plus a `.desktop`
-entry and icon so the GUI appears in your application menu, and a systemd user
-service for the daemon. Use a user prefix without sudo via `PREFIX=~/.local
-./install.sh`. Uninstall with `cmake --build build --target uninstall`.
+`install.sh` only installs an existing build — run `./build.sh` first. It puts
+`dlm`, `dlmd` and `dlm-gui` on the PATH, plus a `.desktop` entry and icon so the
+GUI appears in your application menu, and a systemd user service for the
+daemon. The install prefix is fixed when you build, so for a user install
+without sudo, give the prefix to `build.sh`:
+
+```sh
+PREFIX=~/.local ./build.sh     # configure + build for ~/.local
+./install.sh                   # installs to ~/.local (no sudo)
+```
+
+(`PREFIX=~/.local ./install.sh` on a build configured for another prefix stops
+with an error telling you to rebuild.) The systemd user unit goes where systemd
+looks for it: `<prefix>/lib/systemd/user` for `/usr` and `/usr/local`,
+`~/.local/share/systemd/user` for a `~/.local` prefix. Uninstall with
+`cmake --build build --target uninstall`.
 
 After re-installing an upgrade, run `dlm restart` so the running daemon reloads
 (the client also detects an outdated daemon and restarts it automatically).
@@ -73,7 +85,15 @@ ctest --test-dir build         # unit/integration tests
 ```
 
 Options: `-DDLM_GUI=OFF` (skip the GUI), `-DDLM_ASAN=ON` (AddressSanitizer),
-`-DDLM_INSTALL_SYSTEMD=ON` (systemd user service).
+`-DDLM_INSTALL_SYSTEMD=ON` (systemd user service), `-DDLM_NATIVE=ON`
+(`-march=native`, for local builds only; off by default and forced off by the
+release scripts).
+
+Releases (AppImage, Windows installers) take their version from
+`project(dlm VERSION ...)` in `CMakeLists.txt`; a release tag must match it
+(`installer/check-version.sh`). The release scripts clean their build trees
+first, strip every shipped binary and bundled library, and stop if
+`./check-stripped.sh` finds anything unstripped.
 
 ## Usage
 
@@ -84,7 +104,8 @@ dlm get https://example.com/big.iso -c 8 -o big.iso
 # rate-limited (suffixes k/m/g; applies to the engine and to delegated streams)
 dlm get https://example.com/big.iso --limit 2M
 
-# archive.org — whole item, every file md5-verified
+# archive.org — whole item, every file md5-verified; for a multi-file item
+# -o names the folder the files go into
 dlm get https://archive.org/details/<identifier> -o ./item_dir
 
 # any yt-dlp-supported page (progressive → segmented; HLS/DASH → yt-dlp)
@@ -107,7 +128,7 @@ dlm watch         # live-updating table
 dlm pause|resume|cancel <id>
 dlm rm <id> [-p]              # remove a link, or a whole package with -p
 dlm set -j 5                  # max concurrent downloads
-dlm set --limit 5M            # global speed cap (shared across active); "off" clears it
+dlm set --limit 5M            # global speed cap (shared across active); 0/off/none/unlimited clears it
 
 # JDownloader-style queue control
 dlm start            # resume the queue (global autostart on)

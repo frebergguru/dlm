@@ -32,8 +32,13 @@ Equivalent manual invocation:
 
 ```sh
 docker build -t dlm-winbuild installer/windows
-docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/out dlm-winbuild
+docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/out \
+    --entrypoint /bin/bash dlm-winbuild /src/installer/windows/build.sh
 ```
+
+(`build-win.sh` runs `build.sh` and `dlm.nsi` from the source tree, so script
+changes take effect without rebuilding the image; only `Dockerfile` /
+`prep-libadwaita.sh` changes need `--rebuild`.)
 
 Output in `dist/`:
 
@@ -42,7 +47,15 @@ Output in `dist/`:
 | `dlm-<version>-setup-x64.exe` | 64-bit Windows (PE32+ x86-64) |
 | `dlm-<version>-setup-x86.exe` | 32-bit Windows (PE32 i386) |
 
-`VERSION` is taken from `git describe`; override with `-e VERSION=1.2.3`.
+`VERSION` is the `project(dlm VERSION ...)` value in `CMakeLists.txt`. A
+`VERSION` passed in (`VERSION=1.2.3 ./build-win.sh`, or `-e VERSION=...`) must
+equal it (a leading `v` is ignored), otherwise the build stops.
+
+Each run removes its build/staging dirs and that version's old installers,
+strips every `.exe` and `.dll` (including the MinGW runtime closure and the
+gdk-pixbuf loaders), and refuses to run makensis if `check-stripped.sh` finds
+anything unstripped. Afterwards it checks that both installers were written by
+this run.
 The libadwaita revision is pinned by `LIBADWAITA_TAG` (Docker build arg).
 
 ## What each installer contains
@@ -63,8 +76,12 @@ environment variables are required at runtime.
 - `prep-libadwaita.sh` — cross-compiles libadwaita into both sysroots (run once,
   baked into the image).
 - `build.sh` — per-arch: cross-build the app, gather the runtime closure, run NSIS.
-- `dlm.nsi` — the NSIS (Modern UI 2) installer: Program Files install, Start Menu
-  entry, optional Desktop shortcut, uninstaller, and Add/Remove Programs registry.
+- `dlm.nsi` — the NSIS (Modern UI 2) installer: per-machine Program Files
+  install, all-users Start Menu entry, optional Desktop shortcut, uninstaller,
+  and Add/Remove Programs registry. Before upgrading or uninstalling it closes
+  `dlm-gui.exe`, asks the daemon to stop (`dlm shutdown`) and force-stops a
+  `dlmd.exe` that is still running. "Launch dlm now" starts the GUI as the
+  normal user (via explorer.exe), not elevated.
 
 ## Verified
 

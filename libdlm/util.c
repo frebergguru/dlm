@@ -6,6 +6,8 @@
 #include "dlm/dlm.h"
 #include "internal.h"
 
+#include <string.h>
+
 #include <ctype.h>
 #include <stdarg.h>
 #if defined(_WIN32)
@@ -172,18 +174,11 @@ char *dlm_filename_from_url(const char *url)
         memcpy(out, name, namelen);
         out[namelen] = '\0';
         percent_decode(out);
-        /* sanitise separators / control chars that may survive decoding, and
-         * neutralise a leading '.'/'-' (so a name like ".." can't point at the
-         * parent dir and a leading '-' can't look like an option) — same policy
-         * as the extractors' sanitize_filename/basename_of. */
-        for (char *c = out; *c; c++)
-            if (*c == '/' || *c == '\\' || *c == ':' || (unsigned char)*c < 0x20)
-                *c = '_';
-        if (out[0] == '.' || out[0] == '-') out[0] = '_';
-        if (out[0] == '\0') {
-            free(out);
-            out = dlm_xstrdup("download");
-        }
+        /* separators / control chars that survive decoding, a leading '.'/'-',
+         * Windows-illegal characters and device names: one shared policy */
+        char *safe = dlm_sanitize_component(out, 0);
+        free(out);
+        out = safe;
     }
     return out;
 }
@@ -220,13 +215,20 @@ int64_t dlm_parse_rate(const char *s)
     while (*end == ' ') end++;
     double mult = 1.0;
     switch (tolower((unsigned char)*end)) {
-    case 'k': mult = 1024.0; break;
-    case 'm': mult = 1024.0 * 1024.0; break;
-    case 'g': mult = 1024.0 * 1024.0 * 1024.0; break;
-    case 't': mult = 1024.0 * 1024.0 * 1024.0 * 1024.0; break;
-    case '\0': case 'b': mult = 1.0; break;
-    default: mult = 1.0; break;
+    case 'k': mult = 1024.0; end++; break;
+    case 'm': mult = 1024.0 * 1024.0; end++; break;
+    case 'g': mult = 1024.0 * 1024.0 * 1024.0; end++; break;
+    case 't': mult = 1024.0 * 1024.0 * 1024.0 * 1024.0; end++; break;
+    default: break;
     }
+    /* optional unit tail: "i", "b"/"B", "/s" ("500KiB/s", "2 MB", "1024b").
+     * Anything else is a typo ("2X"), which must not silently become a
+     * different limit, so the whole value is rejected. */
+    if (mult > 1.0 && tolower((unsigned char)*end) == 'i') end++;
+    if (tolower((unsigned char)*end) == 'b') end++;
+    if (end[0] == '/' && tolower((unsigned char)end[1]) == 's') end += 2;
+    while (*end == ' ') end++;
+    if (*end != '\0') return 0;
     double bytes = v * mult;
     if (bytes < 1) bytes = 1;
     /* clamp before the cast: (int64_t)(double > INT64_MAX) is undefined */
@@ -243,4 +245,69 @@ void dlm_format_rate(int64_t bps, char *buf, size_t buflen)
     char b[32];
     dlm_human_bytes(bps, b, sizeof b);
     snprintf(buf, buflen, "%s/s", b);
+}
+
+/* ---- path component sanitising ------------------------------------------ */
+
+static int strncasecmp_portable(const char *a, const char *b, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        int x = tolower((unsigned char)a[i]), y = tolower((unsigned char)b[i]);
+        if (x != y) return x - y;
+        if (!x) return 0;
+    }
+    return 0;
+}
+
+static int is_win_device_name(const char *s)
+{
+    static const char *const names[] = {"CON", "PRN", "AUX", "NUL", NULL};
+    size_t stem = strcspn(s, ".");
+    for (int i = 0; names[i]; i++)
+        if (stem == 3 && strncasecmp_portable(s, names[i], 3) == 0) return 1;
+    if (stem == 4 && (strncasecmp_portable(s, "COM", 3) == 0 ||
+                      strncasecmp_portable(s, "LPT", 3) == 0) &&
+        s[3] >= '1' && s[3] <= '9')
+        return 1;
+    return 0;
+}
+
+char *dlm_sanitize_component(const char *s, size_t max_bytes)
+{
+    if (max_bytes == 0) max_bytes = 200;
+    if (!s) s = "";
+    size_t n = strlen(s);
+    /* room for an optional leading '_' (device name) + NUL */
+    char *out = dlm_xmalloc(n + 2);
+    size_t w = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+        case '/': case '\\': case ':': case '*': case '?':
+        case '"': case '<': case '>': case '|':
+            c = '_';
+            break;
+        default:
+            if (c < 0x20 || c == 0x7f) c = '_';
+        }
+        out[w++] = (char)c;
+    }
+    out[w] = '\0';
+    if (out[0] == '.' || out[0] == '-') out[0] = '_';
+
+    /* cut to max_bytes on a UTF-8 boundary (never split a multibyte char) */
+    if (w > max_bytes) {
+        w = max_bytes;
+        while (w > 0 && ((unsigned char)out[w] & 0xC0) == 0x80) w--;
+        out[w] = '\0';
+    }
+    /* Windows silently drops trailing dots/spaces, which can collide names */
+    while (w > 0 && (out[w - 1] == '.' || out[w - 1] == ' ')) out[--w] = '\0';
+
+    if (w == 0) { free(out); return dlm_xstrdup("download"); }
+    if (is_win_device_name(out)) {
+        memmove(out + 1, out, w + 1);
+        out[0] = '_';
+    }
+    return out;
 }

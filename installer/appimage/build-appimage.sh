@@ -9,17 +9,56 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."          # repo root
-VERSION=${VERSION:-$(git describe --tags --always 2>/dev/null || echo 0.1.0)}
+BUILD_START=$(date +%s)             # every output must be newer than this
+
+# The version comes from CMakeLists.txt's project(dlm VERSION x.y.z), the same
+# value compiled into the binaries (DLM_VERSION_STR). A VERSION from the
+# environment (CI passes the tag) must match it exactly, or the release stops.
+CMAKE_VERSION=$(sed -n 's/^project(dlm VERSION \([0-9][0-9.]*\).*/\1/p' CMakeLists.txt)
+[ -n "$CMAKE_VERSION" ] || { echo "FATAL: no project(dlm VERSION ...) in CMakeLists.txt" >&2; exit 1; }
+VERSION=${VERSION:-$CMAKE_VERSION}
 VERSION=${VERSION#v}                # tags look like v1.2.3
+if [ "$VERSION" != "$CMAKE_VERSION" ]; then
+    echo "FATAL: VERSION '$VERSION' does not match the CMake project version '$CMAKE_VERSION'." >&2
+    echo "       Bump project(dlm VERSION ...) in CMakeLists.txt or fix the tag." >&2
+    exit 1
+fi
 export VERSION                      # linuxdeploy embeds this in the file name
 export APPIMAGE_EXTRACT_AND_RUN=1   # run the tool AppImages without FUSE (CI/containers)
 ARCH=x86_64
 export ARCH
 
 WORK="${WORK:-$PWD/build-appimage}"  # gitignored (build-*/); override to test
+OUTPUT="dist/dlm-$VERSION-$ARCH.AppImage"
+
+# Clean build tree: a stale CMakeCache.txt / old binaries / old AppDir must
+# never end up in a release. Everything in $WORK is recreated below (the tool
+# AppImages are re-downloaded each run). Refuse to wipe a directory that does
+# not look like our build dir, in case WORK points somewhere unexpected.
+if [ -e "$WORK" ]; then
+    case "$(cd "$WORK" && pwd -P)" in
+        /|"${HOME:-/}"|"$(pwd -P)") echo "FATAL: refusing to clean WORK=$WORK" >&2; exit 1 ;;
+    esac
+    if [ -n "$(ls -A "$WORK")" ] && [ ! -f "$WORK/CMakeCache.txt" ] && [ ! -d "$WORK/AppDir" ]; then
+        echo "FATAL: WORK=$WORK is not empty and is not an AppImage build dir; refusing to clean it" >&2
+        exit 1
+    fi
+    echo ">>> cleaning $WORK"
+    rm -rf "$WORK"
+fi
+rm -f "$OUTPUT"                     # old artifact for this version
+
 echo ">>> building dlm (Release, GUI on)"
-cmake -S . -B "$WORK" -DCMAKE_BUILD_TYPE=Release -DDLM_GUI=ON >/dev/null
+# DLM_NATIVE stays OFF: the AppImage must run on any x86-64 CPU.
+cmake -S . -B "$WORK" -DCMAKE_BUILD_TYPE=Release -DDLM_GUI=ON -DDLM_NATIVE=OFF >/dev/null
 cmake --build "$WORK" --target dlm-cli dlmd dlm-gui -j"$(nproc)"
+
+# The freshly built CLI must report the version we are stamping.
+built_version=$("$WORK/dlm" version)
+if [ "$built_version" != "dlm $VERSION" ]; then
+    echo "FATAL: built binary reports '$built_version', expected 'dlm $VERSION'" >&2
+    exit 1
+fi
 
 echo ">>> assembling AppDir"
 APPDIR=$WORK/AppDir
@@ -81,14 +120,36 @@ for lib in libharfbuzz.so.0 libfribidi.so.0; do
 done
 
 # Strip with the host toolchain (handles .relr.dyn, unlike linuxdeploy's bundled
-# strip). System libs ship pre-stripped, so this mainly trims our own binaries.
+# strip). Every ELF in the AppDir is stripped — our binaries and every bundled
+# .so / loader module. A failed strip is reported (never silenced), and the
+# check-stripped.sh run below stops the release if any file is left unstripped.
 echo ">>> stripping bundled binaries"
 while IFS= read -r -d '' f; do
-    file -b "$f" | grep -q ELF && strip --strip-unneeded "$f" 2>/dev/null || true
-done < <(find "$APPDIR/usr/lib" "$APPDIR/usr/bin" -type f -print0)
+    if [ "$(head -c4 "$f" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
+        chmod u+w "$f"
+        case "$f" in
+            *.so|*.so.*) strip --strip-unneeded "$f" || echo "   warning: strip failed: $f" >&2 ;;
+            *)           strip --strip-all "$f"      || echo "   warning: strip failed: $f" >&2 ;;
+        esac
+    fi
+done < <(find "$APPDIR" -type f -print0)
+
+# Enforced: refuse to pack if anything is still unstripped.
+echo ">>> checking that every bundled binary is stripped"
+bash ./check-stripped.sh "$APPDIR" >"$WORK/check-stripped.log" || {
+    grep -v '^  stripped ' "$WORK/check-stripped.log" >&2; exit 1; }
+tail -n1 "$WORK/check-stripped.log"
 
 echo ">>> packaging AppImage"
 mkdir -p dist
 APPIMAGETOOL_APP_NAME=dlm "$WORK/appimagetool.AppImage" \
-    "$APPDIR" "dist/dlm-$VERSION-$ARCH.AppImage"
-echo ">>> produced dist/dlm-$VERSION-$ARCH.AppImage"
+    "$APPDIR" "$OUTPUT"
+
+# Verify the artifact: present, freshly written by this run, and stripped
+# (the AppImage runtime is an ELF too).
+[ -f "$OUTPUT" ] || { echo "FATAL: $OUTPUT was not produced" >&2; exit 1; }
+if [ "$(stat -c %Y "$OUTPUT")" -lt "$BUILD_START" ]; then
+    echo "FATAL: $OUTPUT is older than this build — stale artifact" >&2; exit 1
+fi
+bash ./check-stripped.sh "$OUTPUT" >/dev/null || { bash ./check-stripped.sh "$OUTPUT" >&2; exit 1; }
+echo ">>> produced $OUTPUT"

@@ -14,7 +14,10 @@ int dlm_client_connect(void);
 int dlm_client_connect_existing(void);
 
 /* Send one JSON request line and read one JSON response line.
- * Returns a malloc'd response string (no newline) or NULL on error. */
+ * Returns a malloc'd response string (no newline) or NULL on error.
+ * The exchange has a send/receive timeout (a wedged daemon yields NULL
+ * instead of hanging); the timeout is cleared again before returning, so
+ * the fd can still be read as an open-ended stream (e.g. after "subscribe"). */
 char *dlm_client_rpc(int fd, const char *json_request);
 
 /* Read a single line from the socket (for streaming subscribe events).

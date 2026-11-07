@@ -132,9 +132,24 @@ dlm_store *dlm_store_open(const char *path)
         sqlite3_close(db);
         return NULL;
     }
-    /* migrate older databases; "duplicate column" errors are expected & ignored */
-    for (int i = 0; MIGRATIONS[i]; i++)
-        sqlite3_exec(db, MIGRATIONS[i], NULL, NULL, NULL);
+    /* migrate older databases; "duplicate column" means the column is already
+     * there and is expected. Any other error (busy, locked, corrupt, disk
+     * full) would leave columns missing and every later query failing with
+     * "no such column", so refuse to open instead of limping on. */
+    for (int i = 0; MIGRATIONS[i]; i++) {
+        char *merr = NULL;
+        if (sqlite3_exec(db, MIGRATIONS[i], NULL, NULL, &merr) != SQLITE_OK) {
+            int dup = merr && strstr(merr, "duplicate column name") != NULL;
+            if (!dup) {
+                DLM_ERROR("store: migration failed (%s): %s", MIGRATIONS[i],
+                          merr ? merr : "?");
+                sqlite3_free(merr);
+                sqlite3_close(db);
+                return NULL;
+            }
+        }
+        sqlite3_free(merr);
+    }
     /* now that all columns exist, create the indexes */
     sqlite3_exec(db, INDEXES, NULL, NULL, NULL);
     dlm_store *s = dlm_xcalloc(1, sizeof *s);
@@ -335,7 +350,8 @@ int dlm_store_load_all(dlm_store *s, dlm_store_row_cb cb, void *userdata)
         "position,force,autostart FROM downloads ORDER BY position,id;";
     sqlite3_stmt *st = prep(s, sql);
     if (!st) return -1;
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    int rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
         dlm_store_row row;
         row.id = sqlite3_column_int64(st, 0);
         row.url = (const char *)sqlite3_column_text(st, 1);
@@ -359,6 +375,10 @@ int dlm_store_load_all(dlm_store *s, dlm_store_row_cb cb, void *userdata)
         cb(userdata, &row);
     }
     sqlite3_reset(st);
+    if (rc != SQLITE_DONE) {
+        DLM_ERROR("store: reading the queue failed: %s", sqlite3_errmsg(s->db));
+        return -1;
+    }
     return 0;
 }
 
@@ -457,7 +477,8 @@ int dlm_store_pkg_load_all(dlm_store *s, dlm_store_pkg_cb cb, void *userdata)
         "created_at,source_url FROM packages ORDER BY position,id;";
     sqlite3_stmt *st = prep(s, sql);
     if (!st) return -1;
-    while (sqlite3_step(st) == SQLITE_ROW) {
+    int rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
         dlm_store_pkg_row row;
         row.id = sqlite3_column_int64(st, 0);
         row.name = (const char *)sqlite3_column_text(st, 1);
@@ -472,5 +493,9 @@ int dlm_store_pkg_load_all(dlm_store *s, dlm_store_pkg_cb cb, void *userdata)
         cb(userdata, &row);
     }
     sqlite3_reset(st);
+    if (rc != SQLITE_DONE) {
+        DLM_ERROR("store: reading the queue failed: %s", sqlite3_errmsg(s->db));
+        return -1;
+    }
     return 0;
 }

@@ -43,6 +43,14 @@ dlm_sock_t dlm_unix_connect(const char *path);
 /* Returns 1 if a server currently accepts connections at `path`, else 0. */
 int dlm_unix_probe(const char *path);
 
+/* Single-instance guard for the daemon: take an exclusive, non-blocking lock
+ * on `<sock_path>.lock` (created next to the socket, in the same private
+ * directory) and keep it for the life of the process. Returns 1 when the lock
+ * is ours, 0 when another process already holds it, -1 on error. Taken BEFORE
+ * the socket is bound, so two daemons started at the same moment can't both
+ * pass the connect-probe and then steal each other's socket path. */
+int dlm_instance_lock(const char *sock_path);
+
 /* Accept one pending connection on a (non-blocking) listening socket. Returns
  * the new socket, or DLM_INVALID_SOCK when the backlog is drained. */
 dlm_sock_t dlm_sock_accept(dlm_sock_t lfd);

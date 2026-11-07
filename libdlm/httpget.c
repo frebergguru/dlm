@@ -6,10 +6,17 @@
 #include "dlm/dlm.h"
 
 #include <curl/curl.h>
+#if defined(_WIN32)
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#else
+#  include <netinet/in.h>
+#  include <sys/socket.h>
+#endif
 #include <ctype.h>
 #include <string.h>
 
-#define HTTPGET_UA "dlm/0.1 (+segmented-downloader)"
+#define HTTPGET_UA DLM_USER_AGENT
 #define HTTPGET_MAX (64 * 1024 * 1024) /* cap response bodies at 64 MiB */
 
 /* Restrict a handle to web protocols (and ftp if allow_ftp) on both the request
@@ -93,13 +100,65 @@ typedef struct {
     char *data;
     size_t len;
     size_t cap; /* allocated bytes (>= len + 1) */
+    size_t max; /* body cap in bytes */
 } membuf;
+
+/* ---- public-address-only connections ----------------------------------- */
+
+/* True for addresses a background fetch must never reach: loopback, private,
+ * link-local, CGNAT, multicast/reserved, unspecified, IPv6 ULA/link-local and
+ * IPv4-mapped forms of those. Checked on the address curl actually connects
+ * to, so it also covers redirects and DNS names that resolve inward. */
+static int ip4_internal(const unsigned char a[4])
+{
+    return a[0] == 0 || a[0] == 10 || a[0] == 127 ||
+           (a[0] == 100 && (a[1] & 0xC0) == 64) ||   /* 100.64/10 CGNAT */
+           (a[0] == 169 && a[1] == 254) ||
+           (a[0] == 172 && (a[1] & 0xF0) == 16) ||
+           (a[0] == 192 && a[1] == 168) ||
+           (a[0] == 192 && a[1] == 0 && a[2] == 0) ||
+           (a[0] == 198 && (a[1] & 0xFE) == 18) ||   /* 198.18/15 */
+           a[0] >= 224;                               /* multicast/reserved */
+}
+
+static int addr_internal(const struct sockaddr *sa)
+{
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *in = (const struct sockaddr_in *)sa;
+        return ip4_internal((const unsigned char *)&in->sin_addr);
+    }
+    if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)sa;
+        const unsigned char *b = (const unsigned char *)&in6->sin6_addr;
+        static const unsigned char zero[16] = {0};
+        static const unsigned char loop[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+        if (!memcmp(b, zero, 16) || !memcmp(b, loop, 16)) return 1;
+        if ((b[0] & 0xFE) == 0xFC) return 1;                 /* fc00::/7 */
+        if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return 1; /* fe80::/10 */
+        if (b[0] == 0xFF) return 1;                          /* multicast */
+        static const unsigned char v4map[12] = {0,0,0,0,0,0,0,0,0,0,0xFF,0xFF};
+        if (!memcmp(b, v4map, 12)) return ip4_internal(b + 12);
+        return 0;
+    }
+    return 1; /* anything else (AF_UNIX...) is not a public web address */
+}
+
+static curl_socket_t public_only_opensocket(void *clientp, curlsocktype purpose,
+                                            struct curl_sockaddr *addr)
+{
+    (void)clientp;
+    if (purpose != CURLSOCKTYPE_IPCXN || addr_internal(&addr->addr)) {
+        DLM_WARN("http: refusing connection to a non-public address");
+        return CURL_SOCKET_BAD;
+    }
+    return socket(addr->family, addr->socktype, addr->protocol);
+}
 
 static size_t write_mem(char *ptr, size_t size, size_t nmemb, void *userp)
 {
     membuf *m = userp;
     size_t add = size * nmemb;
-    if (m->len + add > HTTPGET_MAX) return 0;
+    if (m->len + add > m->max) return 0;
     size_t need = m->len + add + 1; /* + NUL terminator */
     if (need > m->cap) {
         /* grow geometrically so a body assembled from many small chunks costs
@@ -144,7 +203,7 @@ static struct curl_slist *build_list(const char *const *headers, int *ok,
 
 static int http_do(const char *url, const char *post_fields,
                    const char *const *headers, char **body, size_t *len,
-                   long *status)
+                   long *status, size_t max_bytes, int public_only)
 {
     /* default the out-params up front so early-error returns never leave the
      * caller reading/freeing an uninitialised *body. */
@@ -156,7 +215,7 @@ static int http_do(const char *url, const char *post_fields,
     CURL *c = curl_easy_init();
     if (!c) return DLM_ERR_NOMEM;
 
-    membuf m = {NULL, 0, 0};
+    membuf m = {NULL, 0, 0, max_bytes ? max_bytes : HTTPGET_MAX};
     int hl_ok = 1;
     char *cookie = NULL;
     struct curl_slist *hl = build_list(headers, &hl_ok, &cookie);
@@ -177,6 +236,13 @@ static int http_do(const char *url, const char *post_fields,
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_mem);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &m);
     if (hl) curl_easy_setopt(c, CURLOPT_HTTPHEADER, hl);
+    if (public_only) {
+        curl_easy_setopt(c, CURLOPT_OPENSOCKETFUNCTION, public_only_opensocket);
+        curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
+        curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
+        /* a declared Content-Length over the cap fails before any body */
+        curl_easy_setopt(c, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)m.max);
+    }
     if (post_fields) {
         curl_easy_setopt(c, CURLOPT_POST, 1L);
         curl_easy_setopt(c, CURLOPT_POSTFIELDS, post_fields);
@@ -205,13 +271,19 @@ static int http_do(const char *url, const char *post_fields,
 int dlm_http_request(const char *url, const char *post_fields,
                      const char *const *headers, char **body, long *status)
 {
-    return http_do(url, post_fields, headers, body, NULL, status);
+    return http_do(url, post_fields, headers, body, NULL, status, 0, 0);
 }
 
 int dlm_http_get_blob(const char *url, const char *const *headers, char **body,
                       size_t *len, long *status)
 {
-    return http_do(url, NULL, headers, body, len, status);
+    return http_do(url, NULL, headers, body, len, status, 0, 0);
+}
+
+int dlm_http_get_public(const char *url, char **body, size_t *len, long *status,
+                        size_t max_bytes)
+{
+    return http_do(url, NULL, NULL, body, len, status, max_bytes, 1);
 }
 
 int dlm_http_get(const char *url, const char *const *headers, char **body,

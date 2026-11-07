@@ -12,14 +12,30 @@ set -euo pipefail
 
 SRC=${SRC:-/src}
 OUT=${OUT:-/out}
-VERSION=${VERSION:-$(git -C "$SRC" describe --tags --always 2>/dev/null || echo 0.1.0)}
+# dlm.nsi sits next to this script (/work in the image, or
+# /src/installer/windows when build-win.sh runs the script from the source tree).
+NSI=${NSI:-$(cd "$(dirname "$0")" && pwd)/dlm.nsi}
+BUILD_START=$(date +%s)             # every output must be newer than this
+
+# Version = CMakeLists.txt project(dlm VERSION x.y.z), the value compiled into
+# the binaries. (git describe is not used: in the root container the uid-1000
+# /src mount trips git's "dubious ownership" check.) A VERSION passed in (CI
+# passes the tag) must match it, with a leading "v" ignored.
+CMAKE_VERSION=$(sed -n 's/^project(dlm VERSION \([0-9][0-9.]*\).*/\1/p' "$SRC/CMakeLists.txt")
+[ -n "$CMAKE_VERSION" ] || { echo "FATAL: no project(dlm VERSION ...) in $SRC/CMakeLists.txt"; exit 1; }
+VERSION=${VERSION:-$CMAKE_VERSION}
+VERSION=${VERSION#v}
+if [ "$VERSION" != "$CMAKE_VERSION" ]; then
+    echo "FATAL: VERSION '$VERSION' does not match the CMake project version '$CMAKE_VERSION'"
+    exit 1
+fi
 LIBADWAITA_TAG=${LIBADWAITA_TAG:-1.7.7}
 mkdir -p "$OUT"
 
 # arch label -> mingw triplet / sysroot / NSIS define
 if [ "${1:-}" = "--clean" ]; then
     echo "### cleaning intermediate build/stage dirs and installer outputs"
-    rm -rf /work/build-* /work/stage-* /work/dlm.ico /work/i-*.png
+    rm -rf /work/build-* /work/stage-* /work/dlm.ico /work/i-*.png /work/check-stripped-*.log
     rm -f "$OUT"/*.exe
     echo "### clean"
     exit 0
@@ -72,17 +88,21 @@ build_arch() {
 
     require_libadwaita "$triplet"
 
+    local outfile="$OUT/dlm-$VERSION-setup-$label.exe"
+
     echo "### cross-building dlm ($label)"
+    # clean tree: old build dir, staging dir and this version's installer
     rm -rf "$b" "$stage"
+    rm -f "$outfile"
     local cmake_wrap=mingw64-cmake; [ "$label" = x86 ] && cmake_wrap=mingw32-cmake
-    "$cmake_wrap" -S "$SRC" -B "$b" -DCMAKE_BUILD_TYPE=Release -DDLM_GUI=ON >/dev/null
+    # DLM_NATIVE stays OFF: the installers must run on any CPU of that arch.
+    "$cmake_wrap" -S "$SRC" -B "$b" -DCMAKE_BUILD_TYPE=Release -DDLM_GUI=ON -DDLM_NATIVE=OFF >/dev/null
     # app targets only (the POSIX-only test suite doesn't build on Windows)
     make -C "$b" dlm-cli dlmd dlm-gui -j"$(nproc)"
 
     echo "### staging runtime ($label)"
     mkdir -p "$stage/bin" "$stage/share" "$stage/lib"
     cp "$b"/dlm.exe "$b"/dlmd.exe "$b"/dlm-gui.exe "$stage/bin/"
-    "${triplet}-strip" "$stage"/bin/*.exe
 
     # gdk-pixbuf loaders (incl. the SVG loader used for icons) + cache
     if [ -d "$sysroot/lib/gdk-pixbuf-2.0" ]; then
@@ -110,14 +130,42 @@ build_arch() {
     collect_dlls "$triplet" "$stage" "${seeds[@]}"
     echo "### staged $(find "$stage" -type f | wc -l) files, bin has $(ls "$stage"/bin/*.dll 2>/dev/null | wc -l) DLLs"
 
+    # Strip EVERY shipped PE: our exes, the collected DLL closure and the
+    # gdk-pixbuf loader DLLs. A strip failure stops the build (set -e).
+    echo "### stripping staged binaries ($label)"
+    local f
+    while IFS= read -r -d '' f; do
+        chmod u+w "$f"
+        "${triplet}-strip" --strip-all "$f"
+    done < <(find "$stage" -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0)
+
+    # Enforced: refuse to package anything unstripped.
+    echo "### checking that every staged binary is stripped ($label)"
+    bash "$SRC/check-stripped.sh" "$stage" >"/work/check-stripped-$label.log" || {
+        grep -v '^  stripped ' "/work/check-stripped-$label.log"; exit 1; }
+    tail -n1 "/work/check-stripped-$label.log"
+
+    # The cross-built binaries must carry the version we are stamping.
+    if ! grep -aq "dlm $VERSION" "$stage/bin/dlm.exe"; then
+        echo "FATAL: $stage/bin/dlm.exe does not contain version string 'dlm $VERSION'"
+        exit 1
+    fi
+
     echo "### makensis ($label)"
     local def64=0; [ "$label" = x64 ] && def64=1
     "$makensis_bin" -V2 \
         -DVERSION="$VERSION" -DARCH="$label" -DARCH64=$def64 \
         -DSTAGE="$stage" -DSRC="$SRC" -DICON=/work/dlm.ico \
-        -DOUTFILE="$OUT/dlm-$VERSION-setup-$label.exe" \
-        /work/dlm.nsi
-    echo "### produced $OUT/dlm-$VERSION-setup-$label.exe"
+        -DOUTFILE="$outfile" \
+        "$NSI"
+
+    # Verify the installer: present, written by this run, stub stripped.
+    [ -f "$outfile" ] || { echo "FATAL: $outfile was not produced"; exit 1; }
+    if [ "$(stat -c %Y "$outfile")" -lt "$BUILD_START" ]; then
+        echo "FATAL: $outfile is older than this build — stale artifact"; exit 1
+    fi
+    bash "$SRC/check-stripped.sh" "$outfile" >/dev/null || { bash "$SRC/check-stripped.sh" "$outfile"; exit 1; }
+    echo "### produced $outfile"
 }
 
 make_icon() {
@@ -136,7 +184,9 @@ make_icon() {
     icotool -c -o /work/dlm.ico "${png[@]}"
 }
 
+# The icon is regenerated every run too (no stale icon from an older build).
+rm -f /work/dlm.ico /work/i-*.png
 make_icon
 for a in x64 x86; do build_arch "$a"; done
 echo "### DONE"
-ls -lh "$OUT"/*.exe
+ls -lh "$OUT/dlm-$VERSION-setup-x64.exe" "$OUT/dlm-$VERSION-setup-x86.exe"

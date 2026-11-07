@@ -16,6 +16,10 @@
 #include "internal.h"
 
 #include <ctype.h>
+#include "compat/compat.h" /* strcasecmp on all platforms */
+#if !defined(_WIN32)
+#  include <strings.h>
+#endif
 
 void dlm_extract_result_free(dlm_extract_result *r)
 {
@@ -87,21 +91,68 @@ static int looks_like_direct_file(const char *url)
     return 0;
 }
 
+/* Is `name` already used (case-insensitively, as on Windows/macOS) by any task
+ * other than `self`? */
+static int name_taken(const dlm_extract_result *r, int self, const char *name)
+{
+    for (int j = 0; j < r->count; j++) {
+        if (j == self || !r->tasks[j].filename) continue;
+        if (strcasecmp(r->tasks[j].filename, name) == 0) return 1;
+    }
+    return 0;
+}
+
+void dlm_extract_dedupe_names(dlm_extract_result *r)
+{
+    if (!r || !r->tasks) return;
+    for (int i = 1; i < r->count; i++) {
+        char *fn = r->tasks[i].filename;
+        if (!fn) continue;
+        /* only rename when an EARLIER task already has this name, so the first
+         * occurrence (and every non-colliding name) keeps its name unchanged */
+        int clash = 0;
+        for (int j = 0; j < i && !clash; j++)
+            if (r->tasks[j].filename && strcasecmp(r->tasks[j].filename, fn) == 0) clash = 1;
+        if (!clash) continue;
+
+        /* split "stem.ext" at the last dot (a leading dot is not an extension) */
+        const char *dot = strrchr(fn, '.');
+        if (dot == fn) dot = NULL;
+        size_t stemlen = dot ? (size_t)(dot - fn) : strlen(fn);
+        const char *ext = dot ? dot : "";
+        size_t cap = strlen(fn) + 24;
+        char *cand = dlm_xmalloc(cap);
+        for (long k = 2;; k++) {
+            snprintf(cand, cap, "%.*s (%ld)%s", (int)stemlen, fn, k, ext);
+            if (!name_taken(r, i, cand)) break;
+        }
+        free(r->tasks[i].filename);
+        r->tasks[i].filename = cand;
+    }
+}
+
 int dlm_extract(const char *url, dlm_extract_result *out)
 {
     if (!url || !out) return DLM_ERR_ARG;
+    int rc;
     if (dlm_is_archiveorg_url(url))
-        return dlm_extract_archiveorg(url, out);
-    if (looks_like_direct_file(url))
-        return extract_direct(url, out);
-    /* a web page / stream: resolve via yt-dlp */
-    int rc = dlm_extract_ytdlp(url, out);
-    if (rc == DLM_OK)
-        return rc;
-    /* yt-dlp rejected this URL (unsupported site, or no extractable media).
-     * Fall back to fetching it directly with the engine — this is how generic
-     * files (download endpoints, extensionless or unrecognised URLs) that
-     * yt-dlp refuses still get downloaded. */
-    DLM_INFO("yt-dlp could not handle %s; downloading it directly", url);
-    return extract_direct(url, out);
+        rc = dlm_extract_archiveorg(url, out);
+    else if (looks_like_direct_file(url))
+        rc = extract_direct(url, out);
+    else {
+        /* a web page / stream: resolve via yt-dlp */
+        rc = dlm_extract_ytdlp(url, out);
+        if (rc != DLM_OK) {
+            /* yt-dlp rejected this URL (unsupported site, or no extractable
+             * media). Fall back to fetching it directly with the engine — this
+             * is how generic files (download endpoints, extensionless or
+             * unrecognised URLs) that yt-dlp refuses still get downloaded. */
+            DLM_INFO("yt-dlp could not handle %s; downloading it directly", url);
+            rc = extract_direct(url, out);
+        }
+    }
+    /* archive.org files from different subfolders share a basename, and
+     * playlist entries can share a title: make output names unique. */
+    if (rc == DLM_OK) dlm_extract_dedupe_names(out);
+    return rc;
 }

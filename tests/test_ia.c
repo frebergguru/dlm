@@ -13,8 +13,64 @@ static int failures = 0;
 #define CHECK(cond, msg)                                                       \
     do { if (!(cond)) { fprintf(stderr, "FAIL: %s\n", msg); failures++; } } while (0)
 
+/* internal (libdlm/extractors/ytdlp.h); declared here to keep this test's
+ * include path to the public headers */
+int dlm_ytdlp_parse(const char *json_text, const char *input_url,
+                    dlm_extract_result *out);
+
+static void set_name(dlm_task *t, const char *n)
+{
+    t->filename = n ? strdup(n) : NULL;
+}
+
+static void test_dedupe_and_ext(void)
+{
+    /* dedupe: later case-insensitive duplicates get " (2)", " (3)" before the
+     * extension; unique names (and the first occurrence) stay unchanged */
+    dlm_extract_result r;
+    memset(&r, 0, sizeof r);
+    r.count = 7;
+    r.tasks = calloc((size_t)r.count, sizeof *r.tasks);
+    set_name(&r.tasks[0], "track01.flac");
+    set_name(&r.tasks[1], "TRACK01.flac");
+    set_name(&r.tasks[2], "other.mp3");
+    set_name(&r.tasks[3], "track01.flac");
+    set_name(&r.tasks[4], "track01 (2).flac"); /* pre-existing name is kept */
+    set_name(&r.tasks[5], "README");
+    set_name(&r.tasks[6], "readme");
+    dlm_extract_dedupe_names(&r);
+    CHECK(strcmp(r.tasks[0].filename, "track01.flac") == 0, "dedupe keeps first");
+    CHECK(strcmp(r.tasks[2].filename, "other.mp3") == 0, "dedupe keeps unique");
+    CHECK(strcmp(r.tasks[4].filename, "track01 (2).flac") == 0, "dedupe keeps unique (2)");
+    CHECK(strcmp(r.tasks[1].filename, "TRACK01 (3).flac") == 0, "dedupe case-insensitive");
+    CHECK(strcmp(r.tasks[3].filename, "track01 (4).flac") == 0, "dedupe third copy");
+    CHECK(strcmp(r.tasks[5].filename, "README") == 0, "dedupe no-ext first");
+    CHECK(strcmp(r.tasks[6].filename, "readme (2)") == 0, "dedupe no-ext");
+    dlm_extract_result_free(&r);
+
+    /* yt-dlp: remote "ext" is sanitised (alnum, <= 10 chars, else "bin") and
+     * the title goes through dlm_sanitize_component */
+    const char *js =
+        "{\"title\":\"P\",\"entries\":["
+        "{\"title\":\"a?b\",\"ext\":\"mp4\",\"webpage_url\":\"https://s/1\",\"protocol\":\"m3u8\"},"
+        "{\"title\":\"x\",\"ext\":\"../../evil\",\"webpage_url\":\"https://s/2\",\"protocol\":\"m3u8\"},"
+        "{\"title\":\"y\",\"ext\":\"abcdefghijk\",\"webpage_url\":\"https://s/3\",\"protocol\":\"m3u8\"},"
+        "{\"title\":\"z\",\"ext\":\"m4a \",\"webpage_url\":\"https://s/4\",\"protocol\":\"m3u8\"}"
+        "]}";
+    CHECK(dlm_ytdlp_parse(js, "https://s", &r) == 0 && r.count == 4, "parse ext playlist");
+    if (r.count == 4) {
+        CHECK(strcmp(r.tasks[0].filename, "a_b.mp4") == 0, "title sanitised, ext kept");
+        CHECK(strcmp(r.tasks[1].filename, "x.bin") == 0, "traversal ext -> bin");
+        CHECK(strcmp(r.tasks[2].filename, "y.bin") == 0, "overlong ext -> bin");
+        CHECK(strcmp(r.tasks[3].filename, "z.bin") == 0, "ext with space -> bin");
+    }
+    dlm_extract_result_free(&r);
+}
+
 int main(void)
 {
+    test_dedupe_and_ext();
+
     /* archive.org URL recognition */
     CHECK(dlm_is_archiveorg_url("https://archive.org/details/foo"), "details url");
     CHECK(dlm_is_archiveorg_url("https://archive.org/download/foo/bar.pdf"), "download url");

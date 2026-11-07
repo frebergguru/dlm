@@ -8,6 +8,11 @@ Type=simple
 ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/dlmd
 Restart=on-failure
 RestartSec=2
+# dlmd exits 3 when another dlmd already owns the socket (e.g. a client
+# auto-started one before this unit ran). Retrying cannot help, so don't loop;
+# the unit stays "failed (exit 3)", which tells you the daemon is running
+# outside systemd. Run 'dlm shutdown' and restart the unit to hand it over.
+RestartPreventExitStatus=3
 
 [Install]
 WantedBy=default.target

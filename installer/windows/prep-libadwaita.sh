@@ -28,7 +28,10 @@ EOF
         --prefix="$sysroot" --buildtype=release --wrap-mode=nodownload \
         -Dexamples=false -Dtests=false -Dvapi=false \
         -Dintrospection=disabled -Ddocumentation=false
-    ninja -C "/tmp/_aw-$cpu" install
+    ninja -C "/tmp/_aw-$cpu"
+    # Install stripped (uses the cross strip from the cross file). build.sh
+    # strips every staged DLL again and check-stripped.sh enforces it.
+    meson install -C "/tmp/_aw-$cpu" --strip
 }
 
 build_one x86_64-w64-mingw32 x86_64

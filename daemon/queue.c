@@ -6,6 +6,7 @@
 #include "dlm/dlm.h"
 #include "dlm/tools.h"
 #include "compat/compat.h"
+#include "internal.h" /* dlm_xmalloc & co: abort on OOM like the library */
 
 #include <errno.h>
 #include <pthread.h>
@@ -157,7 +158,7 @@ static void push(dlm_queue *q, qitem *it)
 {
     if (q->n == q->cap) {
         q->cap = q->cap ? q->cap * 2 : 8;
-        q->items = realloc(q->items, (size_t)q->cap * sizeof *q->items);
+        q->items = dlm_xrealloc(q->items, (size_t)q->cap * sizeof *q->items);
     }
     q->items[q->n++] = it;
 }
@@ -166,7 +167,7 @@ static void push_pkg(dlm_queue *q, pkg *p)
 {
     if (q->npkg == q->cappkg) {
         q->cappkg = q->cappkg ? q->cappkg * 2 : 8;
-        q->pkgs = realloc(q->pkgs, (size_t)q->cappkg * sizeof *q->pkgs);
+        q->pkgs = dlm_xrealloc(q->pkgs, (size_t)q->cappkg * sizeof *q->pkgs);
     }
     q->pkgs[q->npkg++] = p;
 }
@@ -214,8 +215,7 @@ static void ensure_parent_dir(const char *path)
 #endif
     if (!slash || slash == path) return;        /* no dir component / root */
     size_t len = (size_t)(slash - path);
-    char *dir = malloc(len + 1);
-    if (!dir) return;
+    char *dir = dlm_xmalloc(len + 1);
     memcpy(dir, path, len);
     dir[len] = '\0';
     dlm_mkdir_p(dir);
@@ -226,7 +226,7 @@ static void cleanup_partial_files(qitem *it)
 {
     if (!it->out_path) return;
     size_t n = strlen(it->out_path);
-    char *p = malloc(n + 10);
+    char *p = dlm_xmalloc(n + 10);
     sprintf(p, "%s.dlmpart", it->out_path);
     remove(p);
     sprintf(p, "%s.dlmjson", it->out_path);
@@ -310,13 +310,23 @@ static dlm_result run_ytdlp(qitem *it, int64_t rate)
     }
     const char *mext = merge_ext(it->out_path);
     if (mext) { argv[n++] = "--merge-output-format"; argv[n++] = mext; }
+    /* -o is an output TEMPLATE: a literal '%' (e.g. a title containing
+     * "%(id)s") must be written "%%" or yt-dlp expands it. */
+    size_t olen = strlen(it->out_path), pct = 0;
+    for (size_t i = 0; i < olen; i++) if (it->out_path[i] == '%') pct++;
+    char *otmpl = dlm_xmalloc(olen + pct + 1);
+    for (size_t i = 0, w = 0; i <= olen; i++) {
+        otmpl[w++] = it->out_path[i];
+        if (it->out_path[i] == '%') otmpl[w++] = '%';
+    }
     argv[n++] = "-o";
-    argv[n++] = it->out_path;
+    argv[n++] = otmpl;
     argv[n++] = "--";
     argv[n++] = it->url;
     argv[n] = NULL;
 
     dlm_proc *proc = dlm_proc_spawn(argv, DLM_SPAWN_STDOUT_ERR);
+    free(otmpl); /* the child has its own copy (or spawn failed) */
     if (!proc) return DLM_ERR_IO;
 
     /* read yt-dlp output line by line, parsing progress; the 200ms read timeout
@@ -422,7 +432,7 @@ static void *worker_main(void *arg)
 static void load_pkg(void *ud, const dlm_store_pkg_row *row)
 {
     dlm_queue *q = ud;
-    pkg *p = calloc(1, sizeof *p);
+    pkg *p = dlm_xcalloc(1, sizeof *p);
     p->id = row->id;
     p->name = xstrdup(row->name);
     p->folder = xstrdup(row->folder);
@@ -439,7 +449,7 @@ static void load_pkg(void *ud, const dlm_store_pkg_row *row)
 static void load_row(void *ud, const dlm_store_row *row)
 {
     dlm_queue *q = ud;
-    qitem *it = calloc(1, sizeof *it);
+    qitem *it = dlm_xcalloc(1, sizeof *it);
     it->id = row->id;
     it->url = xstrdup(row->url);
     it->out_path = xstrdup(row->out_path);
@@ -465,14 +475,24 @@ static void load_row(void *ud, const dlm_store_row *row)
 
 dlm_queue *dlm_queue_create(dlm_store *store, int max_active)
 {
-    dlm_queue *q = calloc(1, sizeof *q);
+    dlm_queue *q = dlm_xcalloc(1, sizeof *q);
     q->store = store;
     q->max_active = max_active >= 0 ? max_active : 3;
     q->global_autostart = 1;
     q->next_pos = 1;
     pthread_mutex_init(&q->mu, NULL);
-    dlm_store_pkg_load_all(store, load_pkg, q);
-    dlm_store_load_all(store, load_row, q);
+    /* A read error part-way (busy/corrupt db) must not start the daemon with
+     * a silently partial queue. */
+    if (dlm_store_pkg_load_all(store, load_pkg, q) != 0 ||
+        dlm_store_load_all(store, load_row, q) != 0) {
+        for (int i = 0; i < q->n; i++) item_free(q->items[i]);
+        for (int i = 0; i < q->npkg; i++) pkg_free(q->pkgs[i]);
+        free(q->items);
+        free(q->pkgs);
+        pthread_mutex_destroy(&q->mu);
+        free(q);
+        return NULL;
+    }
     /* persist any 'active' rows we just demoted to 'queued', and clear stale
      * force flags */
     for (int i = 0; i < q->n; i++) {
@@ -512,7 +532,7 @@ static char *derive_name(const char *url)
     base = base ? base + 1 : url;
     size_t len = strcspn(base, "?#");
     if (len == 0) { base = "download"; len = 8; }
-    char *out = malloc(len + 1);
+    char *out = dlm_xmalloc(len + 1);
     memcpy(out, base, len);
     out[len] = '\0';
     return out;
@@ -544,7 +564,7 @@ int64_t dlm_queue_add(dlm_queue *q, const char *url, const char *out_path,
     row.created_at = time(NULL);
     int64_t id = dlm_store_add_full(q->store, &row);
     if (id > 0) {
-        qitem *it = calloc(1, sizeof *it);
+        qitem *it = dlm_xcalloc(1, sizeof *it);
         it->id = id;
         it->url = xstrdup(url);
         it->out_path = xstrdup(out_path);
@@ -587,7 +607,7 @@ int64_t dlm_queue_grab(dlm_queue *q, const char *package_name,
         pthread_mutex_unlock(&q->mu);
         return -1;
     }
-    pkg *p = calloc(1, sizeof *p);
+    pkg *p = dlm_xcalloc(1, sizeof *p);
     p->id = pkg_id;
     p->name = xstrdup(package_name ? package_name : "links");
     p->folder = xstrdup(folder);
@@ -620,7 +640,7 @@ int64_t dlm_queue_grab(dlm_queue *q, const char *package_name,
         row.created_at = time(NULL);
         int64_t id = dlm_store_add_full(q->store, &row);
         if (id > 0) {
-            qitem *it = calloc(1, sizeof *it);
+            qitem *it = dlm_xcalloc(1, sizeof *it);
             it->id = id;
             it->url = xstrdup(l->url);
             it->out_path = xstrdup(opath);
@@ -711,6 +731,21 @@ int dlm_queue_confirm(dlm_queue *q, int64_t id, int is_package, int start)
     return moved;
 }
 
+/* After a package's linkgrabber links were removed: delete the package if
+ * nothing references it any more, otherwise (some of its links were already
+ * confirmed into the download list) move it to the download list so those
+ * links keep their package instead of pointing at a deleted row. Caller mu. */
+static void settle_lg_package(dlm_queue *q, pkg *p)
+{
+    for (int i = 0; i < q->n; i++)
+        if (q->items[i]->package_id == p->id) {
+            p->list = DLM_LIST_DOWNLOAD;
+            dlm_store_pkg_set_list(q->store, p->id, "download");
+            return;
+        }
+    drop_if_empty(q, p->id);
+}
+
 /* Remove a single linkgrabber link (no running worker possible). Caller mu. */
 static void lg_erase_link(dlm_queue *q, int64_t id)
 {
@@ -734,10 +769,8 @@ int dlm_queue_lg_remove(dlm_queue *q, int64_t id, int is_package)
                 removed++;
             }
         for (int i = q->npkg - 1; i >= 0; i--)
-            if (q->pkgs[i]->list == DLM_LIST_LINKGRABBER) {
-                dlm_store_pkg_delete(q->store, q->pkgs[i]->id);
-                erase_pkg_at(q, i);
-            }
+            if (q->pkgs[i]->list == DLM_LIST_LINKGRABBER)
+                settle_lg_package(q, q->pkgs[i]); /* may erase index i */
     } else if (is_package) {
         pkg *p = find_pkg(q, id);
         if (!p || p->list != DLM_LIST_LINKGRABBER) { pthread_mutex_unlock(&q->mu); return -1; }
@@ -748,15 +781,23 @@ int dlm_queue_lg_remove(dlm_queue *q, int64_t id, int is_package)
                 erase_at(q, i);
                 removed++;
             }
-        for (int i = 0; i < q->npkg; i++)
-            if (q->pkgs[i]->id == id) { dlm_store_pkg_delete(q->store, id); erase_pkg_at(q, i); break; }
+        settle_lg_package(q, p);
     } else {
         qitem *it = find(q, id);
         if (!it || it->list != DLM_LIST_LINKGRABBER) { pthread_mutex_unlock(&q->mu); return -1; }
         int64_t pkg_id = it->package_id;
         lg_erase_link(q, id);
         removed = 1;
-        drop_if_empty(q, pkg_id);
+        pkg *p = pkg_id > 0 ? find_pkg(q, pkg_id) : NULL;
+        if (p && p->list == DLM_LIST_LINKGRABBER) {
+            int lg_left = 0;
+            for (int i = 0; i < q->n; i++)
+                if (q->items[i]->package_id == pkg_id &&
+                    q->items[i]->list == DLM_LIST_LINKGRABBER) { lg_left = 1; break; }
+            if (!lg_left) settle_lg_package(q, p);
+        } else {
+            drop_if_empty(q, pkg_id);
+        }
     }
     pthread_mutex_unlock(&q->mu);
     return removed;
@@ -1271,8 +1312,8 @@ static int cmp_idslot(const void *a, const void *b)
 int dlm_queue_snapshot(dlm_queue *q, dlm_qsnap **out, int *count)
 {
     pthread_mutex_lock(&q->mu);
-    dlm_qsnap *arr = calloc((size_t)(q->n ? q->n : 1), sizeof *arr);
-    qitem **ord = malloc((size_t)(q->n ? q->n : 1) * sizeof *ord);
+    dlm_qsnap *arr = dlm_xcalloc((size_t)(q->n ? q->n : 1), sizeof *arr);
+    qitem **ord = dlm_xmalloc((size_t)(q->n ? q->n : 1) * sizeof *ord);
     for (int i = 0; i < q->n; i++) ord[i] = q->items[i];
     qsort(ord, (size_t)q->n, sizeof *ord, cmp_item_pos);
     for (int i = 0; i < q->n; i++) {
@@ -1319,11 +1360,11 @@ void dlm_queue_snapshot_free(dlm_qsnap *snap, int count)
 int dlm_queue_packages(dlm_queue *q, dlm_psnap **out, int *count)
 {
     pthread_mutex_lock(&q->mu);
-    dlm_psnap *arr = calloc((size_t)(q->npkg ? q->npkg : 1), sizeof *arr);
-    pkg **ord = malloc((size_t)(q->npkg ? q->npkg : 1) * sizeof *ord);
+    dlm_psnap *arr = dlm_xcalloc((size_t)(q->npkg ? q->npkg : 1), sizeof *arr);
+    pkg **ord = dlm_xmalloc((size_t)(q->npkg ? q->npkg : 1) * sizeof *ord);
     for (int i = 0; i < q->npkg; i++) ord[i] = q->pkgs[i];
     qsort(ord, (size_t)q->npkg, sizeof *ord, cmp_pkg_pos);
-    pkg_idslot *map = malloc((size_t)(q->npkg ? q->npkg : 1) * sizeof *map);
+    pkg_idslot *map = dlm_xmalloc((size_t)(q->npkg ? q->npkg : 1) * sizeof *map);
     for (int i = 0; i < q->npkg; i++) {
         pkg *p = ord[i];
         arr[i].id = p->id;

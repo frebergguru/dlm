@@ -14,11 +14,51 @@
 
 #if defined(_WIN32)
 #  include <io.h>
+#  include <winsock2.h>
 #  define DLMD_NAME "/dlmd.exe"
 #else
+#  include <sys/socket.h>
+#  include <sys/time.h>
 #  include <unistd.h>
 #  define DLMD_NAME "/dlmd"
 #endif
+
+/* Request/response RPCs must not hang forever on a stuck daemon: every daemon
+ * command answers immediately, so a reply that takes longer than this means
+ * the daemon is wedged. Applied only around one request/response exchange
+ * (and the connect-time ping) and cleared afterwards, so long-lived subscribe
+ * streams (CLI `watch`, the GUI) — which may legitimately sit idle — never
+ * time out. */
+#define DLM_RPC_TIMEOUT_MS 15000
+
+/* Set (ms > 0) or clear (ms == 0) the send/receive timeout on a client fd. */
+static void set_io_timeout(int fd, int ms)
+{
+#if defined(_WIN32)
+    DWORD t = (DWORD)ms; /* Winsock: milliseconds as a DWORD, 0 = none */
+    setsockopt((SOCKET)fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&t, sizeof t);
+    setsockopt((SOCKET)fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&t, sizeof t);
+#else
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+#endif
+}
+
+/* Set by read_line/write_all when the last socket error was a timeout. */
+static int g_timed_out;
+
+static int last_error_is_timeout(void)
+{
+#if defined(_WIN32)
+    int e = WSAGetLastError();
+    return e == WSAETIMEDOUT || e == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
 
 /* upper bound on a single protocol line; a peer that never sends '\n' must not
  * be able to grow the read buffer without limit */
@@ -81,8 +121,10 @@ static int write_all(int fd, const char *s, size_t len);
 static int daemon_proto_ok(int fd)
 {
     const char *ping = "{\"cmd\":\"ping\"}\n";
-    if (write_all(fd, ping, strlen(ping)) != 0) return 0;
-    char *line = dlm_client_read_line(fd);
+    set_io_timeout(fd, DLM_RPC_TIMEOUT_MS);
+    char *line = NULL;
+    if (write_all(fd, ping, strlen(ping)) == 0) line = dlm_client_read_line(fd);
+    set_io_timeout(fd, 0);
     if (!line) return 0;
     char marker[32];
     snprintf(marker, sizeof marker, "\"proto\":%d", DLM_PROTO_VERSION);
@@ -115,14 +157,22 @@ int dlm_client_connect(void)
          * matching daemon can take over, then respawn */
         fprintf(stderr, "dlm: restarting outdated daemon\n");
         const char *sd = "{\"cmd\":\"shutdown\"}\n";
-        write_all(fd, sd, strlen(sd));
-        free(dlm_client_read_line(fd));
+        set_io_timeout(fd, DLM_RPC_TIMEOUT_MS);
+        if (write_all(fd, sd, strlen(sd)) == 0) free(dlm_client_read_line(fd));
         dlm_client_close(fd);
-        for (int i = 0; i < 30; i++) {
+        /* the old daemon must be gone before we spawn: otherwise the new one
+         * exits "already running" and we would reconnect to the old one */
+        int gone = 0;
+        for (int i = 0; i < 150; i++) { /* up to ~15s */
             dlm_sleep_ms(100);
             int t = try_connect(path);
-            if (t < 0) break;
+            if (t < 0) { gone = 1; break; }
             dlm_client_close(t);
+        }
+        if (!gone) {
+            fprintf(stderr, "dlm: the outdated daemon did not shut down; "
+                            "stop the running dlmd and try again\n");
+            return -1;
         }
     }
     return spawn_and_wait(path);
@@ -135,6 +185,7 @@ static int write_all(int fd, const char *s, size_t len)
         long w = dlm_sock_write((dlm_sock_t)fd, s + off, len - off);
         if (w < 0) {
             if (dlm_sock_was_intr()) continue;
+            g_timed_out = last_error_is_timeout();
             return -1;
         }
         off += (size_t)w;
@@ -152,6 +203,7 @@ char *dlm_client_read_line(int fd)
         long r = dlm_sock_read((dlm_sock_t)fd, &c, 1);
         if (r < 0) {
             if (dlm_sock_was_intr()) continue;
+            g_timed_out = last_error_is_timeout();
             free(buf);
             return NULL;
         }
@@ -223,8 +275,15 @@ char *dlm_client_rpc(int fd, const char *req)
     memcpy(line, req, len);
     line[len] = '\n';
     line[len + 1] = '\0';
+    g_timed_out = 0;
+    set_io_timeout(fd, DLM_RPC_TIMEOUT_MS);
     int rc = write_all(fd, line, len + 1);
     free(line);
-    if (rc != 0) return NULL;
-    return dlm_client_read_line(fd);
+    char *resp = rc == 0 ? dlm_client_read_line(fd) : NULL;
+    /* clear again: the caller may keep reading this fd as a stream (subscribe) */
+    set_io_timeout(fd, 0);
+    if (!resp && g_timed_out)
+        fprintf(stderr, "dlm: daemon did not respond within %d s\n",
+                DLM_RPC_TIMEOUT_MS / 1000);
+    return resp;
 }

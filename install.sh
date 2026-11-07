@@ -69,7 +69,23 @@ case ":$PATH:" in
 esac
 echo
 echo "Try:   dlm --help        |   launch 'dlm' from your application menu"
-echo "Daemon: starts automatically on first use, or under systemd (if installed):"
-echo "        systemctl --user enable --now dlm.service"
+echo "Daemon: starts automatically on first use."
+# Report where (and whether) the systemd user unit was installed; the dir
+# depends on the prefix (see CMakeLists.txt), so read it from the manifest.
+unit=""
+[ -f "$BUILD_DIR/install_manifest.txt" ] && \
+  unit="$(grep '/dlm\.service$' "$BUILD_DIR/install_manifest.txt" | head -n1 || true)"
+if [ -n "$unit" ]; then
+  echo "        systemd user unit installed: $unit"
+  case "$unit" in
+    /usr/lib/systemd/user/*|/usr/local/lib/systemd/user/*|/lib/systemd/user/*|/etc/systemd/user/*|"$HOME"/.local/share/systemd/user/*|"$HOME"/.config/systemd/user/*)
+      echo "        To run it under systemd instead:"
+      echo "            systemctl --user daemon-reload"
+      echo "            systemctl --user enable --now dlm.service" ;;
+    *)
+      echo "        note: systemd does not search that directory; link it to use it:"
+      echo "            systemctl --user link '$unit' && systemctl --user enable --now dlm.service" ;;
+  esac
+fi
 echo "Upgrade later: ./build.sh && ./install.sh, then 'dlm restart' to reload."
 echo "Uninstall:     $SUDO cmake --build $BUILD_DIR --target uninstall"

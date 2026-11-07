@@ -56,6 +56,11 @@ static void trigger_tools_check(void)
 #define MAX_CLIENT_OUTBUF (8 << 20) /* 8 MiB of unflushed responses/events */
 #define DLMD_MAX_CLIENTS 128        /* refuse past this so a flood can't exhaust fds */
 
+/* Exit status for "another dlmd already owns the socket". Distinct from 1
+ * (real failure) so the systemd unit can use RestartPreventExitStatus=3 and
+ * not retry in a loop when a client already auto-started the daemon. */
+#define DLMD_EXIT_ALREADY_RUNNING 3
+
 typedef struct {
     int fd;
     char *buf;          /* inbound: accumulated bytes awaiting a '\n' */
@@ -103,9 +108,12 @@ static void client_append(client_t *cl, const char *data, size_t n)
         return;
     }
     if (cl->len + n + 1 > cl->cap) {
-        cl->cap = cl->len + n + 1;
-        if (cl->cap < 256) cl->cap = 256;
-        cl->buf = realloc(cl->buf, cl->cap);
+        size_t ncap = cl->len + n + 1;
+        if (ncap < 256) ncap = 256;
+        char *nb = realloc(cl->buf, ncap);
+        if (!nb) { cl->gone = 1; return; } /* OOM: drop this client */
+        cl->buf = nb;
+        cl->cap = ncap;
     }
     memcpy(cl->buf + cl->len, data, n);
     cl->len += n;
@@ -124,7 +132,9 @@ static void client_queue(client_t *cl, const char *s)
     if (need > cl->outcap) {
         size_t nc = cl->outcap ? cl->outcap : 256;
         while (nc < need) nc *= 2;
-        cl->out = realloc(cl->out, nc);
+        char *no = realloc(cl->out, nc);
+        if (!no) { cl->gone = 1; return; } /* OOM: drop this client */
+        cl->out = no;
         cl->outcap = nc;
     }
     memcpy(cl->out + cl->outlen, s, len);
@@ -178,15 +188,33 @@ int main(int argc, char **argv)
     dlm_socket_path(sock_path, sizeof sock_path);
     dlm_db_path(dbpath, sizeof dbpath);
 
-    if (dlm_unix_probe(sock_path)) {
-        fprintf(stderr, "dlmd: already running at %s\n", sock_path);
-        return 1;
+    /* Exclusive lock first, then the connect-probe (which still catches a
+     * daemon from an older version that doesn't take the lock). */
+    int lk = dlm_instance_lock(sock_path);
+    /* Locked but nobody answering on the socket: the previous daemon is in its
+     * shutdown (socket already closed, process not yet gone, e.g. during
+     * "dlm restart"). Give it a few seconds to release the lock. */
+    for (int tries = 0; lk == 0 && tries < 50 && !dlm_unix_probe(sock_path); tries++) {
+        dlm_sleep_ms(100);
+        lk = dlm_instance_lock(sock_path);
     }
+    if (lk == 0 || dlm_unix_probe(sock_path)) {
+        fprintf(stderr, "dlmd: already running at %s\n", sock_path);
+        return DLMD_EXIT_ALREADY_RUNNING;
+    }
+    if (lk < 0)
+        fprintf(stderr, "dlmd: warning: cannot take the instance lock for %s\n",
+                sock_path);
 
     dlm_global_init();
     dlm_store *store = dlm_store_open(dbpath);
     if (!store) { fprintf(stderr, "dlmd: cannot open store %s\n", dbpath); return 1; }
     dlm_queue *q = dlm_queue_create(store, max_active);
+    if (!q) {
+        fprintf(stderr, "dlmd: cannot load the queue from %s\n", dbpath);
+        dlm_store_close(store);
+        return 1;
+    }
 
     dlm_sock_t lfd = dlm_unix_listen(sock_path, 16); /* binds + listens + nonblock */
     if (lfd == DLM_INVALID_SOCK) {
@@ -280,8 +308,13 @@ int main(int argc, char **argv)
             short re = pfd[i + 1].revents;
             if (re & DLM_POLLOUT) client_flush(cl);
             if (cl->gone) continue;
-            if (re & (DLM_POLLHUP | DLM_POLLERR)) { cl->gone = 1; continue; }
-            if (!(re & DLM_POLLIN)) continue;
+            /* A peer that writes a request and closes at once shows up as
+             * POLLIN|POLLHUP: read (and act on) what it sent before dropping
+             * it. Only a hang-up with nothing left to read ends it here. */
+            if (!(re & DLM_POLLIN)) {
+                if (re & (DLM_POLLHUP | DLM_POLLERR)) cl->gone = 1;
+                continue;
+            }
 
             char tmp[4096];
             long got = dlm_sock_read((dlm_sock_t)cl->fd, tmp, sizeof tmp);

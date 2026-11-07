@@ -15,7 +15,13 @@ enum {
 typedef struct dlm_proc dlm_proc;
 
 /* Spawn argv[0] (looked up on PATH if it has no path separator), NULL-terminated
- * argv. Returns an opaque handle or NULL on failure. */
+ * argv. Returns an opaque handle or NULL on failure.
+ *
+ * Capture modes (not DLM_SPAWN_INHERIT): on POSIX the child runs in its own
+ * process group with stdin from /dev/null, so dlm_proc_terminate() reaches its
+ * descendants (yt-dlp's ffmpeg) too. INHERIT children stay in the caller's
+ * group so terminal Ctrl+C reaches them. On Windows every child is placed in a
+ * kill-on-close Job object, and inherits only its own std handles. */
 dlm_proc *dlm_proc_spawn(const char *const argv[], int capture);
 
 /* Read up to n bytes of captured output. timeout_ms < 0 blocks until data or
@@ -24,11 +30,20 @@ dlm_proc *dlm_proc_spawn(const char *const argv[], int capture);
  * spawned with a capture mode. */
 long dlm_proc_read(dlm_proc *p, void *buf, size_t n, int timeout_ms);
 
-/* Request the child terminate (SIGTERM / TerminateProcess). */
+/* Request the child terminate. POSIX: SIGTERM to its process group (capture
+ * modes) or to the child (INHERIT). If anything in it is still running 3 s
+ * later, the next dlm_proc_read()/dlm_proc_wait() escalates to SIGKILL on the
+ * group, so a read loop waiting for EOF cannot hang on a stubborn descendant.
+ * Windows: TerminateJobObject (child + all descendants), else TerminateProcess. */
 void dlm_proc_terminate(dlm_proc *p);
 
+/* Forcefully kill the child (and its process group / job) right away. */
+void dlm_proc_kill(dlm_proc *p);
+
 /* Wait for the child to exit; stores its exit code (or -1 if abnormal). Returns
- * 0 on success, -1 on error. */
+ * 0 on success, -1 on error. After dlm_proc_terminate() this waits at most the
+ * grace period before SIGKILLing the group, and does not return while group
+ * members are still alive within that period. */
 int dlm_proc_wait(dlm_proc *p, int *exit_code);
 
 /* Release the handle (closes the capture pipe; does not wait). */

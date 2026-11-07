@@ -62,7 +62,39 @@ static void default_download_dir(char *buf, size_t len)
             return;
         }
     }
-    snprintf(buf, len, ".");
+    snprintf(buf, len, "."); /* callers sending it to the daemon make it absolute */
+}
+
+/* Make `in` absolute, relative to this client's current directory, into out.
+ * The daemon has its own cwd, so every path sent to it must be absolute.
+ * Returns 0 on success, -1 if the result would not fit / cwd is unknown. */
+static int make_absolute(const char *in, char *out, size_t n)
+{
+    if (!in || !*in) in = ".";
+#if defined(_WIN32)
+    /* _fullpath resolves drive-relative/UNC/forward-slash forms and "." / ".." */
+    if (!_fullpath(out, in, n)) return -1;
+    return 0;
+#else
+    if (in[0] == '/') {
+        if (strlen(in) >= n) return -1;
+        snprintf(out, n, "%s", in);
+        return 0;
+    }
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof cwd)) return -1;
+    while (in[0] == '.' && in[1] == '/') { /* drop leading "./" segments */
+        in += 2;
+        while (*in == '/') in++;
+    }
+    int w;
+    if (!*in || !strcmp(in, "."))
+        w = snprintf(out, n, "%s", cwd);
+    else
+        w = snprintf(out, n, "%s%s%s", cwd,
+                     (cwd[0] && cwd[strlen(cwd) - 1] == '/') ? "" : "/", in);
+    return (w < 0 || (size_t)w >= n) ? -1 : 0;
+#endif
 }
 
 /* ---- host/title save layout (mirrors the GUI) ------------------------- */
@@ -177,13 +209,23 @@ static int delegate_to_ytdlp(const dlm_task *t, const char *out_path, int64_t li
         argv[n++] = "--merge-output-format";
         argv[n++] = mext;
     }
+    /* yt-dlp's -o is an output TEMPLATE: a literal '%' must be written "%%" */
+    size_t olen = strlen(out_path), pct = 0;
+    for (size_t i = 0; i < olen; i++) if (out_path[i] == '%') pct++;
+    char *otmpl = malloc(olen + pct + 1);
+    if (!otmpl) { fprintf(stderr, "dlm: out of memory\n"); return 1; }
+    for (size_t i = 0, j = 0; i <= olen; i++) {
+        otmpl[j++] = out_path[i];
+        if (out_path[i] == '%') otmpl[j++] = '%';
+    }
     argv[n++] = "-o";
-    argv[n++] = out_path;
+    argv[n++] = otmpl;
     argv[n++] = "--";
     argv[n++] = t->url;
     argv[n] = NULL;
 
     dlm_proc *p = dlm_proc_spawn(argv, DLM_SPAWN_INHERIT);
+    free(otmpl);
     if (!p) { fprintf(stderr, "dlm: cannot exec yt-dlp (is it installed?)\n"); return 1; }
     int ec = -1;
     dlm_proc_wait(p, &ec);
@@ -250,8 +292,17 @@ static int cmd_get(int argc, char **argv)
             dir = argv[++i];
         else if ((!strcmp(argv[i], "-c") || !strcmp(argv[i], "--connections")) && i + 1 < argc)
             conns = atoi(argv[++i]);
-        else if ((!strcmp(argv[i], "-l") || !strcmp(argv[i], "--limit")) && i + 1 < argc)
-            limit = dlm_parse_rate(argv[++i]);
+        else if ((!strcmp(argv[i], "-l") || !strcmp(argv[i], "--limit")) && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "0") || !strcasecmp(v, "off") || !strcasecmp(v, "none") ||
+                !strcasecmp(v, "unlimited")) {
+                limit = 0;
+            } else if ((limit = dlm_parse_rate(v)) <= 0) {
+                fprintf(stderr, "dlm: invalid rate '%s' (e.g. 500k, 2M, 1.5G; "
+                                "0/off/none/unlimited = no limit)\n", v);
+                return 2;
+            }
+        }
         else if (argv[i][0] != '-') url = argv[i];
     }
     if (!url) {
@@ -277,10 +328,17 @@ static int cmd_get(int argc, char **argv)
     if (res.count == 1 && out) {
         rc = download_task(&res.tasks[0], out, conns, limit);
     } else {
-        /* one or more files: place them under <dir>/<host>/[<title>/] */
+        /* one or more files: place them under <dir>/<host>/[<title>/], or for
+         * a multi-file item with -o, directly into the -o directory */
         char d[2048];
-        build_dest_dir(d, sizeof d, dir ? dir : ".", url, res.title,
-                       res.count > 1);
+        if (res.count > 1 && out) {
+            if (dir)
+                fprintf(stderr, "dlm: -o names the folder for a multi-file item; ignoring -d\n");
+            snprintf(d, sizeof d, "%s", out);
+        } else {
+            build_dest_dir(d, sizeof d, dir ? dir : ".", url, res.title,
+                           res.count > 1);
+        }
         if (strcmp(d, ".") != 0) dlm_mkdir_p(d);
         if (res.count > 1)
             fprintf(stderr, "dlm: %s -> %d files into %s/\n", res.source, res.count, d);
@@ -401,19 +459,33 @@ static int cmd_restart(void)
         char *resp = dlm_client_rpc(fd, "{\"cmd\":\"shutdown\"}");
         free(resp);
         dlm_client_close(fd);
-        /* wait for the old socket to disappear */
-        for (int i = 0; i < 30; i++) {
+        /* wait for the old daemon to actually go away (connect probe fails);
+         * active downloads are checkpointed on shutdown, so allow ~15s */
+        int gone = 0;
+        for (int i = 0; i < 150; i++) {
             dlm_sleep_ms(100);
             int t = dlm_client_connect_existing();
-            if (t < 0) break;
+            if (t < 0) { gone = 1; break; }
             dlm_client_close(t);
+        }
+        if (!gone) {
+            fprintf(stderr, "dlm: the running daemon did not shut down; not restarted\n"
+                            "     (try again, or stop the dlmd process manually)\n");
+            return 1;
         }
     }
     fd = dlm_client_connect(); /* spawns a fresh daemon */
     if (fd < 0) { fprintf(stderr, "dlm: could not start daemon\n"); return 1; }
     char *resp = dlm_client_rpc(fd, "{\"cmd\":\"ping\"}");
-    free(resp);
     dlm_client_close(fd);
+    json_t *pong = resp ? json_loads(resp, 0, NULL) : NULL;
+    free(resp);
+    int alive = pong && json_is_true(json_object_get(pong, "ok"));
+    if (pong) json_decref(pong);
+    if (!alive) {
+        fprintf(stderr, "dlm: new daemon did not answer; restart failed\n");
+        return 1;
+    }
     printf("daemon restarted\n");
     return 0;
 }
@@ -500,30 +572,45 @@ static int cmd_add(int argc, char **argv)
     }
 
     /* destination directory: -d, else the default download dir, then nested as
-     * <dir>/<host>/[<title>/] to match the GUI's save layout */
+     * <dir>/<host>/[<title>/] to match the GUI's save layout. For a multi-file
+     * item, -o names the destination folder itself. Paths go to the daemon,
+     * whose cwd differs from ours, so they are made absolute first. */
     char dbuf[1024];
     if (!dir) { default_download_dir(dbuf, sizeof dbuf); dir = dbuf; }
-    char dest[2048];
-    build_dest_dir(dest, sizeof dest, dir, url, res.title, res.count > 1);
-    if (strcmp(dest, ".") != 0) dlm_mkdir_p(dest);
+    char adir[4096], aout[4096], dest[4096];
+    if (make_absolute(dir, adir, sizeof adir) != 0
+        || (out && make_absolute(out, aout, sizeof aout) != 0)) {
+        fprintf(stderr, "dlm: cannot resolve the destination path\n");
+        dlm_extract_result_free(&res);
+        return 1;
+    }
+    if (res.count > 1 && out)
+        snprintf(dest, sizeof dest, "%s", aout);
+    else
+        build_dest_dir(dest, sizeof dest, adir, url, res.title, res.count > 1);
+    if (!(res.count == 1 && out)) dlm_mkdir_p(dest);
 
     int fd = dlm_client_connect();
     if (fd < 0) { dlm_extract_result_free(&res); return 1; }
 
     int added = 0;
+    char path[8192] = "";
     for (int i = 0; i < res.count; i++) {
-        char path[4096];
         if (res.count == 1 && out)
-            snprintf(path, sizeof path, "%s", out);
+            snprintf(path, sizeof path, "%s", aout);
         else
             snprintf(path, sizeof path, "%s/%s", dest, res.tasks[i].filename);
         added += send_add(fd, res.tasks[i].url, path, conns, res.tasks[i].delegate);
     }
     dlm_client_close(fd);
-    if (res.count == 1)
-        printf("added 1 download (%s) to %s\n", res.source, dest);
-    else
+    if (res.count == 1) {
+        if (added) printf("added 1 download (%s): %s\n", res.source, path);
+        else fprintf(stderr, "dlm: could not add %s\n", url);
+    } else if (added) {
         printf("added %d/%d files (%s) to %s/\n", added, res.count, res.source, dest);
+    } else {
+        fprintf(stderr, "dlm: could not add any of the %d files from %s\n", res.count, url);
+    }
     dlm_extract_result_free(&res);
     return added > 0 ? 0 : 1;
 }
@@ -550,9 +637,19 @@ static int cmd_set(int argc, char **argv)
         if (!strcmp(argv[i], "-j") && i + 1 < argc) max_active = atoi(argv[++i]);
         else if ((!strcmp(argv[i], "-l") || !strcmp(argv[i], "--limit")) && i + 1 < argc) {
             const char *v = argv[++i];
-            /* "0", "off" or "none" clears the cap */
-            limit = (!strcmp(v, "off") || !strcmp(v, "none")) ? 0 : dlm_parse_rate(v);
-            if (limit < 0) limit = 0;
+            /* "0", "off", "none" or "unlimited" clears the cap; anything else
+             * must parse as a rate, or we refuse rather than silently clear */
+            if (!strcmp(v, "0") || !strcasecmp(v, "off") || !strcasecmp(v, "none")
+                || !strcasecmp(v, "unlimited")) {
+                limit = 0;
+            } else {
+                limit = dlm_parse_rate(v);
+                if (limit <= 0) {
+                    fprintf(stderr, "dlm: invalid rate '%s' (e.g. 500k, 2M, 1.5G; "
+                                    "0/off/none/unlimited clears)\n", v);
+                    return 2;
+                }
+            }
         }
     }
     if (max_active < 0 && limit < 0) {
@@ -860,6 +957,14 @@ static int cmd_grab(int argc, char **argv)
     }
     char dbuf[1024];
     if (!dir) { default_download_dir(dbuf, sizeof dbuf); dir = dbuf; }
+    /* the daemon has its own cwd: send it an absolute folder */
+    char adir[4096];
+    if (make_absolute(dir, adir, sizeof adir) != 0) {
+        fprintf(stderr, "dlm: cannot resolve the destination path '%s'\n", dir);
+        dlm_extract_result_free(&res);
+        return 1;
+    }
+    dir = adir;
 
     /* package name: item title, else URL host, else the extractor name */
     char host[256];
@@ -869,7 +974,7 @@ static int cmd_grab(int argc, char **argv)
                                                      : res.source;
 
     /* lay files out under <dir>/<host>/[<title>/] (title only for multi-file) */
-    char dest[2048];
+    char dest[4096];
     build_dest_dir(dest, sizeof dest, dir, url, res.title, res.count > 1);
 
     json_t *req = req_obj("grab");
@@ -880,7 +985,7 @@ static int cmd_grab(int argc, char **argv)
     json_t *links = json_array();
     for (int i = 0; i < res.count; i++) {
         dlm_task *t = &res.tasks[i];
-        char path[4096];
+        char path[8192];
         snprintf(path, sizeof path, "%s/%s", dest, t->filename);
         json_t *l = json_object();
         json_object_set_new(l, "url", json_string(t->url));

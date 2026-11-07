@@ -25,19 +25,37 @@ static json_t *tools_obj(void)
     return o ? o : json_null();
 }
 
-/* Run a forced tool update check off the poll thread. */
+/* Run a forced tool update check off the poll thread. At most one runs at a
+ * time: repeated "tools_update" requests while one is in flight are folded
+ * into it instead of piling up threads that all wait on the tools lock. */
+static pthread_mutex_t g_tools_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_tools_busy = 0;
+
 static void *tools_update_thread(void *arg)
 {
     (void)arg;
     dlm_tools_check_updates(1);
+    pthread_mutex_lock(&g_tools_mu);
+    g_tools_busy = 0;
+    pthread_mutex_unlock(&g_tools_mu);
     return NULL;
 }
 
 static void trigger_tools_update(void)
 {
+    pthread_mutex_lock(&g_tools_mu);
+    int start = !g_tools_busy;
+    if (start) g_tools_busy = 1;
+    pthread_mutex_unlock(&g_tools_mu);
+    if (!start) return;
     pthread_t th;
-    if (pthread_create(&th, NULL, tools_update_thread, NULL) == 0)
+    if (pthread_create(&th, NULL, tools_update_thread, NULL) == 0) {
         pthread_detach(th);
+    } else {
+        pthread_mutex_lock(&g_tools_mu);
+        g_tools_busy = 0;
+        pthread_mutex_unlock(&g_tools_mu);
+    }
 }
 
 static json_t *snap_array(dlm_queue *q)

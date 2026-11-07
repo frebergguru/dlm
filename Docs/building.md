@@ -11,10 +11,10 @@
 | Variable | Effect |
 |----------|--------|
 | `BUILD_DIR` | build directory (default `build`) |
-| `BUILD_TYPE` | `Debug` (default) / `Release` |
+| `BUILD_TYPE` | `Release` (default) / `Debug` / `RelWithDebInfo` |
 | `NO_GUI=1` | skip the GTK4 GUI |
 | `ASAN=1` | AddressSanitizer + UBSan build |
-| `PREFIX` | install prefix |
+| `PREFIX` | install prefix (baked in at configure time; `./install.sh` installs there) |
 | `NO_SYSTEMD=1` | skip the systemd user unit |
 | `KEEP_BUILD=1` | don't wipe the build dir first |
 

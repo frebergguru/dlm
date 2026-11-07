@@ -87,6 +87,17 @@ int64_t dlm_parse_rate(const char *s);
 /* Format a byte/sec rate into a compact human string (e.g. "1.5 MiB/s"). */
 void dlm_format_rate(int64_t bps, char *buf, size_t buflen);
 
+/* Make one untrusted path component (a title, a remote file name, a host)
+ * safe to use as a single file or directory name on Linux AND Windows:
+ *  - '/', '\\', ':', '*', '?', '"', '<', '>', '|' and control bytes -> '_'
+ *  - a leading '.' or '-' -> '_' (no "."/"..", no dotfiles, no option look)
+ *  - trailing dots and spaces are stripped (Windows drops them silently)
+ *  - Windows device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9, with or
+ *    without an extension) get a leading '_'
+ *  - cut to at most max_bytes bytes (0 = 200) on a UTF-8 character boundary
+ * Never returns an empty string (falls back to "download"). Malloc'd; free(). */
+char *dlm_sanitize_component(const char *s, size_t max_bytes);
+
 #ifdef __cplusplus
 }
 #endif
